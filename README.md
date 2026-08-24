@@ -2,13 +2,14 @@
 
 `dechnik.zabbix` is an Omarchy Quattro bar widget for unresolved Zabbix
 trigger problems. It keeps the most severe visible state in the bar and opens a
-read-only, severity-filterable problem list with host names, age,
-acknowledgment, and suppression state.
+read-only, severity- and acknowledgment-filterable problem list with host
+names, age, acknowledgment, and suppression state.
 
 ## Bar Summary
 
 The bar number is deliberately **not the total problem count**. From the
-retrieved problems that match the selected severity filter, the plugin finds
+retrieved problems that match the selected severity and acknowledgment
+filters, the plugin finds
 the highest numeric severity and counts only problems at exactly that
 severity. Lower-severity problems are not added.
 
@@ -65,6 +66,13 @@ The minimum role/API setup is:
 - Enable **Access to API** for the token owner's role.
 - Permit `problem.get` and `trigger.get`. If the role uses an API-method Allow
   list, add both exact methods. If it uses a Deny list, do not deny them.
+- Permit `user.checkAuthentication` **only if** you use the *only acknowledged
+  by me* filter. The plugin calls it once per endpoint and token to learn the
+  token owner's user id, which `problem.get` then uses as `action_userids`. The
+  call is unauthenticated — the token travels in the request body, not the
+  `Authorization` header. If the method is denied, the refresh still succeeds:
+  the panel shows a notice and lists problems acknowledged by anyone rather than
+  silently hiding other people's work.
 - `apiinfo.version` is only available to unauthenticated callers. The plugin
   calls it without the token before its first authenticated request, so it is
   not a permission that can or needs to be granted to the token's role.
@@ -124,6 +132,8 @@ are persisted in the widget entry in `~/.config/omarchy/shell.json` and hot-relo
 | `refreshIntervalSec` | `60` | Integer from `15` to `3600`; settings UI step `15`. |
 | `problemLimit` | `100` | Integer from `1` to `1000`; settings UI step `25`. |
 | `severities` | `["0", "1", "2", "3", "4", "5"]` | One or more of `0` Not classified, `1` Information, `2` Warning, `3` Average, `4` High, `5` Disaster. The panel will not remove the final selected severity. |
+| `acknowledgement` | `"All"` | `All`, `Unacknowledged`, or `Acknowledged`. Case-insensitive; `any`, `unack`, and `ack` are accepted from the CLI. Anything else normalizes to `All`. |
+| `acknowledgedByMe` | `false` | `true` narrows `Acknowledged` to problems **you** acknowledged. Inert on `All` and `Unacknowledged`, where the panel control is dimmed. Needs `user.checkAuthentication`. |
 
 Examples:
 
@@ -131,11 +141,14 @@ Examples:
 omarchy bar set dechnik.zabbix refreshIntervalSec 120
 omarchy bar set dechnik.zabbix problemLimit 250
 omarchy bar set dechnik.zabbix severities 4,5
+omarchy bar set dechnik.zabbix acknowledgement Unacknowledged
+omarchy bar set dechnik.zabbix acknowledgedByMe true
 omarchy bar set dechnik.zabbix tokenFile '~/.config/omarchy/zabbix/token'
 ```
 
 Values outside numeric ranges are clamped by the runtime. Invalid or empty
-severity selections normalize to all six severities.
+severity selections normalize to all six severities, and an unrecognized
+`acknowledgement` normalizes to `All`.
 
 ## TLS
 
@@ -176,20 +189,46 @@ omarchy bar set dechnik.zabbix insecureTls false
 | Right click the bar widget | Request an immediate refresh without opening the panel. |
 | Hover the bar widget | Show the highest-severity summary and loading, stale, truncation, or insecure-TLS state. |
 | Click the panel refresh button | Request an immediate refresh. |
+| Click the warnings row | Expand or collapse the full warning text. |
+| Click `FILTERS` | Expand or collapse the severity and acknowledgement controls. |
 | Click a severity | Include or exclude it; the final selected severity cannot be removed. |
+| Click an acknowledgement state | Show `All`, `Unacknowledged`, or `Acknowledged` problems. |
+| Click *only acknowledged by me* | Narrow `Acknowledged` to your own acknowledgements. Dimmed and inert on the other two states. |
 | Click a problem row | Move the panel cursor to that read-only row. |
 
-The list is sorted by severity descending, then newest first. Severity changes
-are persisted, immediately filter the last published result, and trigger a new
-server-filtered request. The panel shows all visible hosts returned by Zabbix
-and marks acknowledged and suppressed problems; it never changes Zabbix state.
+### Panel Layout
+
+The panel spends its height on problems. Warnings collapse to a single counted
+row (`⚠ 2 warnings`) and the severity and acknowledgement controls collapse
+under one `FILTERS` row; both start collapsed every time the panel opens and
+expand on click or `Enter`. The collapsed state is panel-local — it is not a
+setting and is never written to `shell.json`.
+
+Expanding `FILTERS` reveals both control groups under captions, `Severity`
+first and `Acknowledgement` below it. The six severity chips use short labels
+(`NC`, `Info`, `Warn`, `Avg`, `High`, `Disaster`) to fit one row; hover a chip
+for the full severity name.
+
+Two exceptions to the collapsing: an unconfigured widget forces its setup
+notice open, because a bare `⚠ 1 warning` would hide the only thing worth
+saying. Refresh progress gets no banner at all — the header meta line already
+reads `Connecting`, `Loading problems`, or `Waiting for data`, and the bar
+carries the activity glyph.
+
+The list is sorted by severity descending, then newest first. Severity and
+acknowledgement changes are persisted, immediately filter the last published
+result, and trigger a new server-filtered request. *Only acknowledged by me* is
+the exception: it has no client-side equivalent because a published problem
+records no acknowledging user, so it applies once the new result arrives. The
+panel shows all visible hosts returned by Zabbix and marks acknowledged and
+suppressed problems; it never changes Zabbix state.
 
 ### Keyboard
 
 | Key | Action |
 |---|---|
-| `Up` / `Down` or `j` / `k` | Move through the six severity controls and problem rows. |
-| `Enter` | Toggle the focused severity. Problem rows have no activation action. |
+| `Up` / `Down` or `j` / `k` | Move through the warnings row, the `FILTERS` row, and problem rows. While `FILTERS` is expanded the six severity controls, the three acknowledgement controls, and the *only acknowledged by me* control join the path between them. |
+| `Enter` | Expand or collapse the focused warnings or `FILTERS` row, toggle the focused severity, select the focused acknowledgement state, or toggle *only acknowledged by me*. Problem rows have no activation action. |
 | `r` | Request an immediate refresh. |
 | `Esc` | Close the panel. |
 | `Tab` / `Shift+Tab` | Switch to the next/previous panel in the same bar section and monitor. |
@@ -210,9 +249,10 @@ omarchy-shell dechnik.zabbix status
 
 `show` is an alias of `open`; `hide` is an alias of `close`; `refresh` returns
 `ok`. `status` returns a sanitized one-line state such as
-`zabbix severity=high count=3 version=7.0.0 age=12s` and may add `stale`,
-`refreshing`, `truncated`, or `insecure-tls`. It does not include the endpoint,
-token, problem names, or host names.
+`zabbix severity=high count=3 ack=all version=7.0.0 age=12s` and may add
+`stale`, `refreshing`, `truncated`, `ack-by-me`, `identity-unavailable`, or
+`insecure-tls`. It does not include the endpoint, token, problem names, or host
+names.
 
 On a multi-monitor bar, use the shell router for a panel-toggle hotkey:
 
@@ -229,8 +269,10 @@ equal configurations share polling state and published data across monitors.
 ## Limits And Refresh Behavior
 
 - Each `problem.get` asks for `problemLimit + 1` newest matching unresolved
-  trigger problems. The extra row detects truncation and is discarded; at most
-  `problemLimit` valid problems are displayed.
+  trigger problems. The severity and acknowledgement filters are applied by
+  Zabbix, not locally, so the limit is spent only on problems you asked to see.
+  The extra row detects truncation and is discarded; at most `problemLimit`
+  valid problems are displayed.
 - When the extra row exists, the panel warns that more matching problems may
   exist and IPC status includes `truncated`. Counts and filters then describe
   only the retained result, never a server-wide total.
@@ -240,6 +282,11 @@ equal configurations share polling state and published data across monitors.
 - A refresh is atomic: version checking, `problem.get`, and, when needed,
   batched `trigger.get` host enrichment must complete before replacing the
   published result. During refresh, the last complete result stays visible.
+- With *only acknowledged by me* enabled, one `user.checkAuthentication` runs
+  between the version check and `problem.get`. The resulting user id is cached
+  for as long as the endpoint and token are unchanged. A failure is cached too,
+  so a denied method does not add a failing call to every poll; pressing `r`
+  clears it and retries.
 - After a failed refresh, a previous complete result stays visible and is
   marked stale with the current error. A first failure has no data and appears
   unavailable, not as zero. A later complete success clears stale/error state
@@ -259,6 +306,10 @@ equal configurations share polling state and published data across monitors.
 - Authenticated requests pass the token to a short-lived Bash process through
   `ZABBIX_TOKEN`; Bash feeds the Bearer header to curl through curl config on
   standard input. `/proc/<pid>/cmdline` therefore does not contain the token.
+- `user.checkAuthentication` is the one request that carries the token in the
+  JSON body instead of the Bearer header, because Zabbix defines it that way.
+  It travels the same curl-config-on-stdin path, stays inside TLS, and is
+  redacted from error text like every other secret.
 - The token does exist in the mode-`0600` file, in `omarchy-shell` QML memory,
   in the child process environment while a request runs, and briefly in Bash
   and curl memory. Environment variables are not a secret from root or from
@@ -302,6 +353,13 @@ omarchy-shell dechnik.zabbix status
 - **Version or response/API error:** Zabbix older than 7.0 is unsupported.
   Proxies and login pages returning HTML cause a malformed-response error.
   Unknown JSON-RPC errors are shown in sanitized form.
+- **Empty list after filtering:** `status` echoes the active filter as
+  `ack=all|unacknowledged|acknowledged` plus `ack-by-me`. An `Unacknowledged`
+  state on a well-tended Zabbix legitimately returns nothing.
+- **`identity-unavailable`:** `user.checkAuthentication` failed, so *only
+  acknowledged by me* is not applied and the list shows every acknowledged
+  problem. Permit the method for the token owner's role, then press `r` to
+  retry; the failure is cached until then.
 - **Stale or truncated:** Stale means the displayed complete result predates a
   failed refresh. Truncated means `problemLimit` was exceeded. Refresh after
   fixing the error or raise the limit with awareness of larger API responses.

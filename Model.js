@@ -19,13 +19,24 @@ var PROBLEM_OUTPUT = [
   "acknowledged", "suppressed", "cause_eventid"
 ]
 
+var ACKNOWLEDGEMENTS = [
+  { value: "all", label: "All" },
+  { value: "unacknowledged", label: "Unacknowledged" },
+  { value: "acknowledged", label: "Acknowledged" }
+]
+
+// Zabbix event update action bitmask; 2 selects the acknowledge action.
+var ACK_ACTION_ACKNOWLEDGE = 2
+
+// `short` keeps the six filter chips on one row of the panel; `label` is what
+// a problem row and every message says.
 var SEVERITIES = [
-  { value: 0, label: "Not classified", color: "#97AAB3" },
-  { value: 1, label: "Information", color: "#7499FF" },
-  { value: 2, label: "Warning", color: "#FFC859" },
-  { value: 3, label: "Average", color: "#FFA059" },
-  { value: 4, label: "High", color: "#E97659" },
-  { value: 5, label: "Disaster", color: "#E45959" }
+  { value: 0, label: "Not classified", short: "NC", color: "#97AAB3" },
+  { value: 1, label: "Information", short: "Info", color: "#7499FF" },
+  { value: 2, label: "Warning", short: "Warn", color: "#FFC859" },
+  { value: 3, label: "Average", short: "Avg", color: "#FFA059" },
+  { value: 4, label: "High", short: "High", color: "#E97659" },
+  { value: 5, label: "Disaster", short: "Disaster", color: "#E45959" }
 ]
 
 function text(value) {
@@ -146,10 +157,50 @@ function severityDefinition(value) {
     ? SEVERITIES[number] : null
 }
 
+// The generated settings form stores an enum option's label, while the CLI
+// writes whatever the user typed. Parsing accepts both plus the obvious
+// shorthands; persistence always writes the label back.
+var ACKNOWLEDGEMENT_ALIASES = {
+  "": "all",
+  "all": "all",
+  "any": "all",
+  "unacknowledged": "unacknowledged",
+  "unacknowledge": "unacknowledged",
+  "unack": "unacknowledged",
+  "not-acknowledged": "unacknowledged",
+  "false": "unacknowledged",
+  "0": "unacknowledged",
+  "acknowledged": "acknowledged",
+  "acknowledge": "acknowledged",
+  "ack": "acknowledged",
+  "true": "acknowledged",
+  "1": "acknowledged"
+}
+
+function acknowledgementDefinition(value) {
+  var canonical = parseAcknowledgement(value)
+  for (var i = 0; i < ACKNOWLEDGEMENTS.length; i++) {
+    if (ACKNOWLEDGEMENTS[i].value === canonical) return ACKNOWLEDGEMENTS[i]
+  }
+  return ACKNOWLEDGEMENTS[0]
+}
+
+function parseAcknowledgement(raw) {
+  var token = trim(raw).toLowerCase()
+  var matched = ACKNOWLEDGEMENT_ALIASES[token]
+  return matched === undefined ? "all" : matched
+}
+
+function persistAcknowledgement(value) {
+  return acknowledgementDefinition(value).label
+}
+
 function normalizeSettings(settings, home) {
   var source = settings || {}
   var endpoint = normalizeEndpoint(source.url === undefined ? source.endpoint : source.url)
   var severities = parseSeveritySelection(source.severities)
+  var acknowledgement = parseAcknowledgement(source.acknowledgement)
+  var acknowledgedByMe = boolValue(source.acknowledgedByMe, false)
   return {
     url: endpoint,
     endpoint: endpoint,
@@ -160,7 +211,13 @@ function normalizeSettings(settings, home) {
     refreshIntervalSec: clampInteger(source.refreshIntervalSec, DEFAULT_REFRESH_INTERVAL_SEC, MIN_REFRESH_INTERVAL_SEC, MAX_REFRESH_INTERVAL_SEC),
     problemLimit: clampInteger(source.problemLimit, DEFAULT_PROBLEM_LIMIT, MIN_PROBLEM_LIMIT, MAX_PROBLEM_LIMIT),
     severities: severities,
-    severitySetting: severities.join(",")
+    severitySetting: severities.join(","),
+    acknowledgement: acknowledgement,
+    acknowledgedByMe: acknowledgedByMe,
+    // "Only acknowledged by me" refines the acknowledged state; it is inert on
+    // the other two states, so only the effective flag reaches the request and
+    // the configuration signature.
+    acknowledgedByMeActive: acknowledgement === "acknowledged" && acknowledgedByMe
   }
 }
 
@@ -277,6 +334,8 @@ function configurationSignature(settings, token, home) {
     String(normalized.refreshIntervalSec),
     String(normalized.problemLimit),
     normalized.severitySetting,
+    normalized.acknowledgement,
+    normalized.acknowledgedByMeActive ? "1" : "0",
     sha256(text(token))
   ].join("\u0000")
   return sha256(material)
@@ -365,10 +424,12 @@ function buildApiInfoVersionRequest(id) {
   return request(id === undefined ? 1 : id, "apiinfo.version", {})
 }
 
-function buildProblemGetRequest(severities, problemLimit, id) {
-  var selected = parseSeveritySelection(severities)
-  var limit = clampInteger(problemLimit, DEFAULT_PROBLEM_LIMIT, MIN_PROBLEM_LIMIT, MAX_PROBLEM_LIMIT)
-  return request(id === undefined ? 2 : id, "problem.get", {
+function buildProblemGetRequest(options, id) {
+  var config = options || {}
+  var selected = parseSeveritySelection(config.severities)
+  var limit = clampInteger(config.problemLimit, DEFAULT_PROBLEM_LIMIT, MIN_PROBLEM_LIMIT, MAX_PROBLEM_LIMIT)
+  var acknowledgement = parseAcknowledgement(config.acknowledgement)
+  var params = {
     output: PROBLEM_OUTPUT.slice(),
     selectTags: ["tag", "value"],
     source: 0,
@@ -378,7 +439,25 @@ function buildProblemGetRequest(severities, problemLimit, id) {
     sortfield: ["eventid"],
     sortorder: "DESC",
     limit: limit + 1
-  })
+  }
+  if (acknowledgement === "unacknowledged") params.acknowledged = false
+  else if (acknowledgement === "acknowledged") {
+    params.acknowledged = true
+    // Without a resolved user id the "by me" narrowing is dropped rather than
+    // guessed; the panel says so instead of silently hiding other people's work.
+    var userId = idString(config.acknowledgedByUserId)
+    if (userId !== "") {
+      params.action = ACK_ACTION_ACKNOWLEDGE
+      params.action_userids = [userId]
+    }
+  }
+  return request(id === undefined ? 2 : id, "problem.get", params)
+}
+
+function buildUserCheckAuthenticationRequest(token, id) {
+  var value = firstNonEmptyLine(token)
+  if (value === "") throw new Error("API token is empty")
+  return request(id === undefined ? 4 : id, "user.checkAuthentication", { token: value })
 }
 
 function uniqueIds(values) {
@@ -499,6 +578,15 @@ function parseVersionResponse(raw, expectedId) {
   return { ok: true, category: "", message: "", code: null, result: version.raw, version: version }
 }
 
+function parseIdentityResponse(raw, expectedId, secrets) {
+  var parsed = parseJsonRpcResponse(raw, expectedId === undefined ? 4 : expectedId, "user.checkAuthentication", secrets)
+  if (!parsed.ok) return parsed
+  var result = parsed.result
+  var userId = result && typeof result === "object" && !(result instanceof Array) ? idString(result.userid) : ""
+  if (userId === "") return errorResult("malformed-response", "Zabbix did not return the API token's user", null)
+  return { ok: true, category: "", message: "", code: null, result: userId, userId: userId }
+}
+
 function idString(value) {
   var output = trim(value)
   return /^\d+$/.test(output) && output !== "0" ? output : ""
@@ -610,13 +698,22 @@ function joinProblemHosts(problems, hostMap) {
   return output
 }
 
-function filterProblems(problems, severities) {
+// The acknowledgement argument mirrors the server-side problem.get filter so a
+// payload carried over from the previous configuration stays consistent until
+// the refetch lands. "Only acknowledged by me" has no client-side equivalent:
+// a published problem records no acknowledging user.
+function filterProblems(problems, severities, acknowledgement) {
   var selected = parseSeveritySelection(severities)
+  var state = parseAcknowledgement(acknowledgement)
   var allowed = {}
   var output = []
   for (var i = 0; i < selected.length; i++) allowed[selected[i]] = true
   for (var p = 0; p < (problems || []).length; p++) {
-    if (problems[p] && allowed[Number(problems[p].severity)]) output.push(problems[p])
+    var problem = problems[p]
+    if (!problem || !allowed[Number(problem.severity)]) continue
+    if (state === "acknowledged" && problem.acknowledged !== true) continue
+    if (state === "unacknowledged" && problem.acknowledged === true) continue
+    output.push(problem)
   }
   return output
 }
@@ -640,8 +737,9 @@ function highestSeveritySummary(problems, severities, state) {
   var options = state || {}
   var available = typeof options === "boolean" ? options : options.available !== false
   var truncated = typeof options === "object" && options.truncated === true
+  var acknowledgement = typeof options === "object" ? options.acknowledgement : undefined
   if (!available) return { available: false, count: 0, severity: null, definition: null, color: "", truncated: truncated }
-  var matching = filterProblems(problems, severities)
+  var matching = filterProblems(problems, severities, acknowledgement)
   var highest = -1
   var count = 0
   for (var i = 0; i < matching.length; i++) {
@@ -662,10 +760,11 @@ function highestSeveritySummary(problems, severities, state) {
   }
 }
 
-function severitySummary(problems, severities, available, truncated) {
+function severitySummary(problems, severities, available, truncated, acknowledgement) {
   return highestSeveritySummary(problems, severities, {
     available: available !== false,
-    truncated: truncated === true
+    truncated: truncated === true,
+    acknowledgement: acknowledgement
   })
 }
 
@@ -783,6 +882,8 @@ if (typeof module !== "undefined") {
     FETCH_SCRIPT: FETCH_SCRIPT,
     PROBLEM_OUTPUT: PROBLEM_OUTPUT,
     SEVERITIES: SEVERITIES,
+    ACKNOWLEDGEMENTS: ACKNOWLEDGEMENTS,
+    ACK_ACTION_ACKNOWLEDGE: ACK_ACTION_ACKNOWLEDGE,
     trim: trim,
     clampInteger: clampInteger,
     expandHome: expandHome,
@@ -799,6 +900,9 @@ if (typeof module !== "undefined") {
     severityDefinition: severityDefinition,
     severityByValue: severityDefinition,
     severityValues: severityValues,
+    parseAcknowledgement: parseAcknowledgement,
+    persistAcknowledgement: persistAcknowledgement,
+    acknowledgementDefinition: acknowledgementDefinition,
     sha256: sha256,
     tokenDigest: sha256,
     configurationSignature: configurationSignature,
@@ -814,6 +918,7 @@ if (typeof module !== "undefined") {
     buildApiInfoVersionRequest: buildApiInfoVersionRequest,
     buildProblemGetRequest: buildProblemGetRequest,
     buildTriggerGetRequest: buildTriggerGetRequest,
+    buildUserCheckAuthenticationRequest: buildUserCheckAuthenticationRequest,
     requestBody: requestBody,
     safeMessage: safeMessage,
     parseCurlOutput: parseCurlOutput,
@@ -822,6 +927,7 @@ if (typeof module !== "undefined") {
     classifyJsonRpcError: classifyJsonRpcError,
     parseJsonRpcResponse: parseJsonRpcResponse,
     parseVersionResponse: parseVersionResponse,
+    parseIdentityResponse: parseIdentityResponse,
     normalizeTags: normalizeTags,
     normalizeProblem: normalizeProblem,
     normalizeProblemResult: normalizeProblemResult,

@@ -24,7 +24,9 @@
       "insecureTls": false,
       "refreshIntervalSec": 60,
       "problemLimit": 100,
-      "severities": ["0", "1", "2", "3", "4", "5"]
+      "severities": ["0", "1", "2", "3", "4", "5"],
+      "acknowledgement": "All",
+      "acknowledgedByMe": false
     },
     "schema": [
       {
@@ -88,6 +90,21 @@
           { "value": "4", "label": "High" },
           { "value": "5", "label": "Disaster" }
         ]
+      },
+      {
+        "key": "acknowledgement",
+        "type": "enum",
+        "label": "Acknowledgement",
+        "options": ["All", "Unacknowledged", "Acknowledged"],
+        "defaultValue": "All",
+        "description": "Narrow the panel list and the bar count to problems in this acknowledgement state."
+      },
+      {
+        "key": "acknowledgedByMe",
+        "type": "boolean",
+        "label": "Only acknowledged by me",
+        "defaultValue": false,
+        "description": "Applies only while Acknowledgement is Acknowledged. Needs user.checkAuthentication permitted for the API token's role."
       }
     ]
   }

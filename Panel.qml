@@ -17,6 +17,11 @@ Panel {
     property int cursorIndex: 0
     property bool cursorActive: false
 
+    // Disclosure state is deliberately panel-local and resets on every open:
+    // the panel exists to show problems, so the chrome starts out of the way.
+    property bool noticesExpanded: false
+    property bool filtersExpanded: false
+
     readonly property color foreground: bar ? bar.foreground : Color.foreground
     readonly property color barTextColor: bar ? bar.barForeground : Color.foreground
     readonly property color urgent: bar ? bar.urgent : Color.urgent
@@ -25,14 +30,29 @@ Panel {
     readonly property bool vertical: bar ? bar.vertical : false
 
     readonly property var selectedSeverities: Model.parseSeveritySelection(zabbix.selectedSeverities)
-    readonly property var visibleProblems: Model.sortProblems(Model.filterProblems(zabbix.problems, selectedSeverities))
-    readonly property var summary: Model.severitySummary(zabbix.problems, selectedSeverities, zabbix.hasData, zabbix.truncated)
+    readonly property string acknowledgement: zabbix.acknowledgement
+    readonly property bool acknowledgedByMe: zabbix.acknowledgedByMeSetting
+    readonly property bool acknowledgedByMeEnabled: acknowledgement === "acknowledged"
+    readonly property var visibleProblems: Model.sortProblems(Model.filterProblems(zabbix.problems, selectedSeverities, acknowledgement))
+    readonly property var summary: Model.severitySummary(zabbix.problems, selectedSeverities, zabbix.hasData, zabbix.truncated, acknowledgement)
     readonly property int summaryCount: summaryNumber()
     readonly property int summarySeverityValue: summaryValue()
     readonly property var summarySeverity: summarySeverityValue >= 0 ? Model.severityDefinition(summarySeverityValue) : null
     readonly property bool summaryAvailable: zabbix.hasData && (!summary || summary.available !== false)
     readonly property color summaryColor: summaryAvailable && summaryCount > 0 && summarySeverity ? summarySeverity.color : dim
-    readonly property int cursorCount: Model.SEVERITIES.length + visibleProblems.length
+    readonly property var notices: noticeList()
+    readonly property bool hasNotices: notices.length > 0
+    // An unconfigured widget has nothing else to show, so its setup notice is
+    // never worth hiding behind a count.
+    readonly property bool noticesOpen: hasNotices && (noticesExpanded || !zabbix.configured)
+
+    readonly property int noticesCursorIndex: hasNotices ? 0 : -1
+    readonly property int filtersCursorIndex: hasNotices ? 1 : 0
+    readonly property int severityCursorBase: filtersCursorIndex + 1
+    readonly property int acknowledgementCursorBase: severityCursorBase + Model.SEVERITIES.length
+    readonly property int acknowledgedByMeCursorIndex: acknowledgementCursorBase + Model.ACKNOWLEDGEMENTS.length
+    readonly property int problemCursorBase: filtersExpanded ? acknowledgedByMeCursorIndex + 1 : severityCursorBase
+    readonly property int cursorCount: problemCursorBase + visibleProblems.length
     readonly property string activityGlyph: zabbix.loading ? "󰑐" : (zabbix.stale ? "󰅖" : "")
     readonly property string barCount: summaryAvailable ? String(summaryCount) : "?"
 
@@ -61,8 +81,77 @@ Panel {
         return String(definition.label !== undefined ? definition.label : definition.name || "Unknown");
     }
 
+    function severityShortLabel(definition) {
+        if (!definition)
+            return "?";
+        return String(definition.short !== undefined ? definition.short : severityLabel(definition));
+    }
+
+    // Actionable state only. Progress ("connecting", "loading problems") is
+    // already on the hero meta line and the bar glyph, so it earns no banner.
+    function noticeList() {
+        var list = [];
+        if (!zabbix.configured)
+            list.push({
+                message: "Configure the Zabbix HTTPS URL and API token file in this widget's settings.",
+                urgent: false
+            });
+        if (zabbix.lastError !== "")
+            list.push({
+                message: errorTitle() + ": " + zabbix.lastError,
+                urgent: true
+            });
+        if (zabbix.stale && zabbix.hasData)
+            list.push({
+                message: "Showing the last complete result because the latest refresh failed.",
+                urgent: true
+            });
+        if (zabbix.acknowledgedByMe && zabbix.identityError !== "")
+            list.push({
+                message: "Zabbix did not identify the API token's user, so the acknowledged-by-me filter is not applied. Permit user.checkAuthentication for the token's role. " + zabbix.identityError,
+                urgent: true
+            });
+        if (zabbix.truncated && zabbix.hasData)
+            list.push({
+                message: "The configured problem limit was reached. More matching problems may exist.",
+                urgent: true
+            });
+        if (zabbix.insecureTls)
+            list.push({
+                message: "TLS certificate verification is disabled. The API token and monitoring data may be intercepted.",
+                urgent: true
+            });
+        return list;
+    }
+
+    function noticeSummary() {
+        var count = notices.length;
+        return count + (count === 1 ? " warning" : " warnings");
+    }
+
+    function noticesUrgent() {
+        for (var i = 0; i < notices.length; i++)
+            if (notices[i].urgent)
+                return true;
+        return false;
+    }
+
     function severitySelected(value) {
         return selectedSeverities.indexOf(Number(value)) !== -1;
+    }
+
+    function writeSettings(patch) {
+        var entry = {
+            id: moduleName
+        };
+        for (var key in settings)
+            if (key !== "id")
+                entry[key] = settings[key];
+        for (var changed in patch)
+            entry[changed] = patch[changed];
+        settings = entry;
+        if (bar && bar.shell && typeof bar.shell.updateEntryInline === "function")
+            bar.shell.updateEntryInline(moduleName, entry);
     }
 
     function toggleSeverity(value) {
@@ -80,18 +169,30 @@ Panel {
             return a - b;
         });
 
-        var entry = {
-            id: moduleName
-        };
-        for (var key in settings)
-            if (key !== "id")
-                entry[key] = settings[key];
-        entry.severities = next.map(function (value) {
-            return String(value);
+        root.writeSettings({
+            severities: next.map(function (value) {
+                return String(value);
+            })
         });
-        settings = entry;
-        if (bar && bar.shell && typeof bar.shell.updateEntryInline === "function")
-            bar.shell.updateEntryInline(moduleName, entry);
+    }
+
+    // The settings form stores an enum option's label, so the panel writes the
+    // same label form back rather than the internal lowercase value.
+    function setAcknowledgement(value) {
+        var next = Model.parseAcknowledgement(value);
+        if (next === acknowledgement)
+            return;
+        root.writeSettings({
+            acknowledgement: Model.persistAcknowledgement(next)
+        });
+    }
+
+    function toggleAcknowledgedByMe() {
+        if (!acknowledgedByMeEnabled)
+            return;
+        root.writeSettings({
+            acknowledgedByMe: !acknowledgedByMe
+        });
     }
 
     function problemSeverity(problem) {
@@ -134,6 +235,8 @@ Panel {
             var phase = String(zabbix.connectionState || "").toLowerCase();
             if (phase === "check_version" || phase === "checking-version")
                 return "Checking server version";
+            if (phase === "identify_user" || phase === "identifying-user")
+                return "Identifying the API token's user";
             if (phase === "fetch_problems" || phase === "fetching-problems")
                 return "Loading problems";
             if (phase === "enrich_hosts" || phase === "enriching-hosts")
@@ -269,6 +372,11 @@ Panel {
             parts.push("refreshing");
         if (zabbix.truncated)
             parts.push("truncated");
+        parts.push("ack=" + root.acknowledgement);
+        if (zabbix.acknowledgedByMe)
+            parts.push("ack-by-me");
+        if (zabbix.acknowledgedByMe && zabbix.identityError !== "")
+            parts.push("identity-unavailable");
         if (zabbix.insecureTls)
             parts.push("insecure-tls");
         var version = safeVersion();
@@ -296,8 +404,28 @@ Panel {
     function activateCursor() {
         if (!cursorActive)
             return;
-        if (cursorIndex >= 0 && cursorIndex < Model.SEVERITIES.length)
-            toggleSeverity(Model.SEVERITIES[cursorIndex].value);
+        if (hasNotices && cursorIndex === noticesCursorIndex) {
+            noticesExpanded = !noticesExpanded;
+            return;
+        }
+        if (cursorIndex === filtersCursorIndex) {
+            filtersExpanded = !filtersExpanded;
+            return;
+        }
+        // Collapsed filters contribute no cursor stops; everything past the
+        // header is a read-only problem row.
+        if (!filtersExpanded)
+            return;
+        if (cursorIndex >= severityCursorBase && cursorIndex < acknowledgementCursorBase) {
+            toggleSeverity(Model.SEVERITIES[cursorIndex - severityCursorBase].value);
+            return;
+        }
+        if (cursorIndex >= acknowledgementCursorBase && cursorIndex < acknowledgedByMeCursorIndex) {
+            setAcknowledgement(Model.ACKNOWLEDGEMENTS[cursorIndex - acknowledgementCursorBase].value);
+            return;
+        }
+        if (cursorIndex === acknowledgedByMeCursorIndex)
+            toggleAcknowledgedByMe();
     }
 
     function setCursor(index) {
@@ -324,10 +452,24 @@ Panel {
     }
 
     function scrollCursorIntoView() {
-        if (cursorIndex < Model.SEVERITIES.length)
-            scrollItemIntoView(severityRepeater.itemAt(cursorIndex));
+        if (cursorIndex >= problemCursorBase) {
+            scrollItemIntoView(problemRepeater.itemAt(cursorIndex - problemCursorBase));
+            return;
+        }
+        if (hasNotices && cursorIndex === noticesCursorIndex) {
+            scrollItemIntoView(noticesHeader);
+            return;
+        }
+        if (cursorIndex === filtersCursorIndex) {
+            scrollItemIntoView(filtersHeader);
+            return;
+        }
+        if (cursorIndex < acknowledgementCursorBase)
+            scrollItemIntoView(severityRepeater.itemAt(cursorIndex - severityCursorBase));
+        else if (cursorIndex < acknowledgedByMeCursorIndex)
+            scrollItemIntoView(acknowledgementGroup);
         else
-            scrollItemIntoView(problemRepeater.itemAt(cursorIndex - Model.SEVERITIES.length));
+            scrollItemIntoView(acknowledgedByMeControl);
     }
 
     implicitWidth: button.implicitWidth
@@ -336,6 +478,8 @@ Panel {
     onOpenedChanged: if (opened) {
         cursorActive = false;
         cursorIndex = 0;
+        noticesExpanded = false;
+        filtersExpanded = false;
         nowMs = Date.now();
         if (panelFlick)
             panelFlick.contentY = 0;
@@ -552,64 +696,66 @@ Panel {
                         }
                     }
 
-                    StateNotice {
-                        message: "TLS certificate verification is disabled. The API token and monitoring data may be intercepted."
-                        tone: root.urgent
-                        visible: zabbix.insecureTls
+                    DisclosureHeader {
+                        id: noticesHeader
+                        visible: root.hasNotices
+                        label: root.noticeSummary()
+                        glyph: root.noticesUrgent() ? "󰀦" : ""
+                        tone: root.noticesUrgent() ? root.urgent : root.dim
+                        expanded: root.noticesOpen
+                        // Forced open while unconfigured; no point offering a toggle.
+                        toggleable: zabbix.configured
+                        cursorTargetIndex: root.noticesCursorIndex
+                        onToggled: root.noticesExpanded = !root.noticesExpanded
                     }
 
-                    StateNotice {
-                        message: "Configure the Zabbix HTTPS URL and API token file in this widget's settings."
-                        tone: root.dim
-                        visible: !zabbix.configured
-                    }
+                    Column {
+                        width: parent.width
+                        visible: root.noticesOpen
+                        spacing: Style.space(8)
 
-                    StateNotice {
-                        message: zabbix.hasData ? "Refreshing problems; the last complete result remains visible." : "Connecting and loading Zabbix problems…"
-                        tone: root.dim
-                        visible: zabbix.configured && zabbix.loading
-                    }
+                        Repeater {
+                            model: root.notices
 
-                    StateNotice {
-                        message: "Showing the last complete result because the latest refresh failed."
-                        tone: root.urgent
-                        visible: zabbix.stale && zabbix.hasData
-                    }
-
-                    StateNotice {
-                        message: root.errorTitle() + (zabbix.lastError !== "" ? ": " + zabbix.lastError : ".")
-                        tone: root.urgent
-                        visible: zabbix.lastError !== ""
-                    }
-
-                    StateNotice {
-                        message: "The configured problem limit was reached. More matching problems may exist."
-                        tone: root.urgent
-                        visible: zabbix.truncated && zabbix.hasData
-                    }
-
-                    StateNotice {
-                        message: "Waiting for the first problem refresh."
-                        tone: root.dim
-                        visible: zabbix.configured && !zabbix.loading && !zabbix.hasData && zabbix.lastError === ""
+                            StateNotice {
+                                required property var modelData
+                                message: String(modelData.message)
+                                tone: modelData.urgent === true ? root.urgent : root.dim
+                            }
+                        }
                     }
 
                     PanelSeparator {
                         foreground: root.foreground
                     }
 
-                    Column {
-                        width: parent.width
-                        spacing: Style.space(8)
+                    DisclosureHeader {
+                        id: filtersHeader
+                        label: "FILTERS"
+                        tone: root.dim
+                        expanded: root.filtersExpanded
+                        cursorTargetIndex: root.filtersCursorIndex
+                        onToggled: root.filtersExpanded = !root.filtersExpanded
+                    }
 
-                        PanelSectionHeader {
-                            text: "SEVERITIES"
-                            foreground: root.foreground
-                            fontFamily: root.fontFamily
+                    Column {
+                        id: filtersContent
+                        width: parent.width
+                        visible: root.filtersExpanded
+                        spacing: Style.space(6)
+
+                        // Indented one step under the FILTERS header so the two
+                        // captioned groups read as its contents, not as peers.
+                        readonly property real indent: Style.space(10)
+
+                        FilterGroupLabel {
+                            x: filtersContent.indent
+                            text: "Severity"
                         }
 
                         Flow {
-                            width: parent.width
+                            x: filtersContent.indent
+                            width: filtersContent.width - filtersContent.indent
                             spacing: Style.space(6)
 
                             Repeater {
@@ -620,9 +766,62 @@ Panel {
                                     required property var modelData
                                     required property int index
                                     definition: modelData
-                                    controlIndex: index
+                                    controlIndex: root.severityCursorBase + index
                                 }
                             }
+                        }
+
+                        FilterGroupLabel {
+                            x: filtersContent.indent
+                            topPadding: Style.space(6)
+                            text: "Acknowledgement"
+                        }
+
+                        ButtonGroup {
+                            id: acknowledgementGroup
+                            x: filtersContent.indent
+                            options: Model.ACKNOWLEDGEMENTS
+                            value: root.acknowledgement
+                            foreground: root.foreground
+                            accent: Color.accent
+                            fontFamily: root.fontFamily
+                            fontSize: Style.font.bodySmall
+                            focusable: false
+                            cursorIndex: root.cursorActive ? root.cursorIndex - root.acknowledgementCursorBase : -1
+
+                            onChanged: function (value) {
+                                root.setAcknowledgement(value);
+                            }
+                            onHovered: function (index, isHovered) {
+                                if (isHovered)
+                                    root.setCursor(root.acknowledgementCursorBase + index);
+                            }
+                        }
+
+                        Button {
+                            id: acknowledgedByMeControl
+                            x: filtersContent.indent
+                            text: "Only acknowledged by me"
+                            iconText: root.acknowledgedByMe ? "󰄬" : ""
+                            selected: root.acknowledgedByMe && root.acknowledgedByMeEnabled
+                            bordered: true
+                            hasCursor: root.cursorActive && root.cursorIndex === root.acknowledgedByMeCursorIndex
+                            enabled: root.acknowledgedByMeEnabled
+                            // Button paints no disabled state of its own.
+                            opacity: enabled ? 1 : 0.45
+                            tooltipText: root.acknowledgedByMeEnabled ? "Show only problems you acknowledged" : "Select Acknowledged to use this filter"
+                            foreground: root.foreground
+                            fontFamily: root.fontFamily
+                            fontSize: Style.font.bodySmall
+                            iconSize: Style.font.bodySmall
+                            horizontalPadding: Style.space(8)
+                            verticalPadding: Style.space(5)
+
+                            onHovered: function (hovered) {
+                                if (hovered)
+                                    root.setCursor(root.acknowledgedByMeCursorIndex);
+                            }
+                            onClicked: root.toggleAcknowledgedByMe()
                         }
                     }
 
@@ -657,7 +856,7 @@ Panel {
                     Text {
                         visible: zabbix.hasData && root.visibleProblems.length === 0
                         width: parent.width
-                        text: "No unresolved problems match the selected severities."
+                        text: "No unresolved problems match the selected filters."
                         color: root.dim
                         font.family: root.fontFamily
                         font.pixelSize: Style.font.body
@@ -688,7 +887,7 @@ Panel {
                     Text {
                         visible: zabbix.configured
                         width: parent.width
-                        text: "↑↓/j/k navigate · enter toggle severity · r refresh · esc close · tab switch panel"
+                        text: "↑↓/j/k navigate · enter expand or toggle · r refresh · esc close · tab switch panel"
                         color: root.dim
                         font.family: root.fontFamily
                         font.pixelSize: Style.font.caption
@@ -696,6 +895,76 @@ Panel {
                     }
                 }
             }
+        }
+    }
+
+    component FilterGroupLabel: Text {
+        color: root.dim
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+    }
+
+    component DisclosureHeader: CursorSurface {
+        id: disclosure
+        property string label: ""
+        property string glyph: ""
+        property color tone: root.dim
+        property bool expanded: false
+        property bool toggleable: true
+        property int cursorTargetIndex: -1
+
+        signal toggled
+
+        width: parent ? parent.width : implicitWidth
+        hasCursor: root.cursorActive && cursorTargetIndex >= 0 && root.cursorIndex === cursorTargetIndex
+        foreground: root.foreground
+        implicitHeight: disclosureLabel.implicitHeight + Style.space(12)
+
+        MouseArea {
+            anchors.fill: parent
+            hoverEnabled: true
+            cursorShape: disclosure.toggleable ? Qt.PointingHandCursor : Qt.ArrowCursor
+            onEntered: if (disclosure.cursorTargetIndex >= 0)
+                root.setCursor(disclosure.cursorTargetIndex)
+            onClicked: if (disclosure.toggleable)
+                disclosure.toggled()
+        }
+
+        Row {
+            anchors.left: parent.left
+            anchors.leftMargin: Style.space(8)
+            anchors.verticalCenter: parent.verticalCenter
+            spacing: Style.space(6)
+
+            Text {
+                visible: disclosure.glyph !== ""
+                text: disclosure.glyph
+                color: disclosure.tone
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                anchors.verticalCenter: parent.verticalCenter
+            }
+
+            Text {
+                id: disclosureLabel
+                text: disclosure.label
+                color: disclosure.tone
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                font.bold: true
+                anchors.verticalCenter: parent.verticalCenter
+            }
+        }
+
+        Text {
+            anchors.right: parent.right
+            anchors.rightMargin: Style.space(8)
+            anchors.verticalCenter: parent.verticalCenter
+            visible: disclosure.toggleable
+            text: disclosure.expanded ? "󰅀" : "󰅂"
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
         }
     }
 
@@ -729,7 +998,8 @@ Panel {
         property int controlIndex: 0
         readonly property bool chosen: definition ? root.severitySelected(definition.value) : false
 
-        text: definition ? root.severityLabel(definition) : ""
+        text: definition ? root.severityShortLabel(definition) : ""
+        tooltipText: definition ? root.severityLabel(definition) : ""
         iconText: chosen ? "󰄬" : ""
         selected: chosen
         bordered: true
@@ -753,7 +1023,7 @@ Panel {
         id: problemRow
         property var problem: null
         property int rowIndex: 0
-        readonly property int navigationIndex: Model.SEVERITIES.length + rowIndex
+        readonly property int navigationIndex: root.problemCursorBase + rowIndex
         readonly property var severity: Model.severityDefinition(root.problemSeverity(problem))
 
         hasCursor: root.cursorActive && root.cursorIndex === navigationIndex

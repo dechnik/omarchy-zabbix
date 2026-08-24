@@ -15,6 +15,11 @@ Item {
     readonly property string tokenFilePath: normalized.tokenFile
     readonly property bool insecureTls: normalized.insecureTls
     readonly property var selectedSeverities: normalized.severities
+    readonly property string acknowledgement: normalized.acknowledgement
+    // The raw checkbox state, kept distinct from the effective filter so the
+    // panel can show it ticked while the acknowledgement state renders it inert.
+    readonly property bool acknowledgedByMeSetting: normalized.acknowledgedByMe
+    readonly property bool acknowledgedByMe: normalized.acknowledgedByMeActive
     readonly property bool configured: normalized.endpoint !== "" && tokenFilePath !== ""
     readonly property bool hasData: lastUpdatedMs > 0
     readonly property string signature: Model.configurationSignature(settings, token, home)
@@ -31,6 +36,9 @@ Item {
     property string lastError: ""
     property string errorCategory: ""
     property string serverVersion: ""
+    property string identityUserId: ""
+    property string identityUserSignature: ""
+    property string identityError: ""
     property double lastUpdatedMs: 0
     property var problems: []
     property bool truncated: false
@@ -62,7 +70,7 @@ Item {
 
         var carry = authorizationChanged ? null : currentPayload();
         if (carry) {
-            carry.problems = Model.filterProblems(carry.problems, selectedSeverities);
+            carry.problems = Model.filterProblems(carry.problems, selectedSeverities, acknowledgement);
             carry.stale = true;
         }
         if (joinedSignature !== "")
@@ -77,7 +85,14 @@ Item {
             applyShared(shared);
     }
 
+    function forgetIdentity() {
+        identityUserId = "";
+        identityUserSignature = "";
+        identityError = "";
+    }
+
     function resetPublished() {
+        forgetIdentity();
         problems = [];
         truncated = false;
         serverVersion = "";
@@ -102,7 +117,8 @@ Item {
             errorCategory: errorCategory,
             connectionState: connectionState,
             failureStreak: failureStreak,
-            insecureTls: insecureTls
+            insecureTls: insecureTls,
+            identityError: identityError
         };
     }
 
@@ -119,7 +135,8 @@ Item {
             errorCategory: String(payload.errorCategory || ""),
             connectionState: String(payload.connectionState || ""),
             failureStreak: Number(payload.failureStreak || 0),
-            insecureTls: payload.insecureTls === true
+            insecureTls: payload.insecureTls === true,
+            identityError: String(payload.identityError || "")
         };
     }
 
@@ -135,6 +152,7 @@ Item {
         errorCategory = String(payload.errorCategory || "");
         connectionState = String(payload.connectionState || (lastUpdatedMs > 0 ? "connected" : "error"));
         failureStreak = Number(payload.failureStreak || 0);
+        identityError = String(payload.identityError || "");
         loading = false;
     }
 
@@ -206,15 +224,39 @@ Item {
 
         activeClaimId = Shared.currentClaim(signature);
         transaction = Model.beginTransaction(sharedBasePayload);
+        if (force === true)
+            identityError = "";
         loading = true;
         stale = hasData && stale;
         lastError = "";
         errorCategory = "";
         if (validatedSignature === signature && serverVersion !== "")
-            startProblemsRequest();
+            startNextDataRequest();
         else
             startVersionRequest();
         return true;
+    }
+
+    // The token's own user id is only needed for the "acknowledged by me"
+    // filter, so it is resolved lazily and cached per endpoint+token. A failed
+    // resolution is remembered too; a forced refresh clears it and retries.
+    function identityRequired() {
+        if (!acknowledgedByMe)
+            return false;
+        if (identityUserSignature === authorizationSignature && identityUserId !== "")
+            return false;
+        return identityError === "";
+    }
+
+    function resolvedUserId() {
+        return identityUserSignature === authorizationSignature ? identityUserId : "";
+    }
+
+    function startNextDataRequest() {
+        if (identityRequired())
+            startIdentityRequest();
+        else
+            startProblemsRequest();
     }
 
     function startVersionRequest() {
@@ -222,9 +264,27 @@ Item {
         startRequest("version", Model.buildApiInfoVersionRequest(1), false);
     }
 
+    function startIdentityRequest() {
+        connectionState = "identify_user";
+        var identityRequest;
+        try {
+            identityRequest = Model.buildUserCheckAuthenticationRequest(token, 4);
+        } catch (exception) {
+            identityError = Model.safeMessage(exception.message, [token]);
+            startProblemsRequest();
+            return;
+        }
+        startRequest("identity", identityRequest, false);
+    }
+
     function startProblemsRequest() {
         connectionState = "fetch_problems";
-        startRequest("problems", Model.buildProblemGetRequest(selectedSeverities, normalized.problemLimit, 2), true);
+        startRequest("problems", Model.buildProblemGetRequest({
+            severities: selectedSeverities,
+            problemLimit: normalized.problemLimit,
+            acknowledgement: acknowledgement,
+            acknowledgedByUserId: acknowledgedByMe ? resolvedUserId() : ""
+        }, 2), true);
     }
 
     function startHostsRequest() {
@@ -289,6 +349,28 @@ Item {
             var versionSignature = signature;
             Qt.callLater(function () {
                 if (root.loading && root.activeGeneration === versionGeneration && root.signature === versionSignature && root.activeClaimId > 0)
+                    root.startNextDataRequest();
+            });
+            return;
+        }
+
+        if (requestPhase === "identity") {
+            var identityResult = Model.parseIdentityResponse(transport.body, 4, [token]);
+            if (identityResult.ok) {
+                identityUserId = identityResult.userId;
+                identityUserSignature = authorizationSignature;
+                identityError = "";
+            } else {
+                // Losing the identity only costs the "by me" narrowing, so the
+                // refresh continues and the panel explains the wider result.
+                identityUserId = "";
+                identityUserSignature = "";
+                identityError = identityResult.message || "Zabbix did not identify the API token's user";
+            }
+            var identityGeneration = activeGeneration;
+            var identitySignature = signature;
+            Qt.callLater(function () {
+                if (root.loading && root.activeGeneration === identityGeneration && root.signature === identitySignature && root.activeClaimId > 0)
                     root.startProblemsRequest();
             });
             return;
@@ -361,6 +443,7 @@ Item {
         payload.connectionState = insecureTls ? "insecure" : "connected";
         payload.failureStreak = 0;
         payload.insecureTls = insecureTls;
+        payload.identityError = identityError;
         transaction = null;
         var claim = activeClaimId;
         activeClaimId = 0;
@@ -391,9 +474,11 @@ Item {
                 errorCategory: errorCategory,
                 connectionState: connectionState,
                 failureStreak: nextFailureStreak,
-                insecureTls: insecureTls
+                insecureTls: insecureTls,
+                identityError: identityError
             };
             payload.stale = payload.lastUpdatedMs > 0;
+            payload.identityError = identityError;
             payload.lastError = message;
             payload.errorCategory = category;
             payload.connectionState = "error";

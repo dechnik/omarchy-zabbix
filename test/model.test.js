@@ -33,7 +33,9 @@ var normalized = Model.normalizeSettings({
   tokenFile: "~/token",
   caCertificateFile: "~/ca.pem",
   insecureTls: "true",
-  severities: "5,2,2,bad,-1"
+  severities: "5,2,2,bad,-1",
+  acknowledgement: "Acknowledged",
+  acknowledgedByMe: "yes"
 }, "/home/u")
 assert.strictEqual(normalized.endpoint, "https://z.example/zabbix/api_jsonrpc.php")
 assert.strictEqual(normalized.refreshIntervalSec, Model.MIN_REFRESH_INTERVAL_SEC)
@@ -42,6 +44,16 @@ assert.strictEqual(normalized.tokenFile, "/home/u/token")
 assert.strictEqual(normalized.caCertificateFile, "/home/u/ca.pem")
 assert.strictEqual(normalized.insecureTls, true)
 assert.deepStrictEqual(normalized.severities, [2, 5])
+assert.strictEqual(normalized.acknowledgement, "acknowledged")
+assert.strictEqual(normalized.acknowledgedByMe, true)
+assert.strictEqual(normalized.acknowledgedByMeActive, true)
+
+// "Only acknowledged by me" is inert outside the acknowledged state.
+var inertByMe = Model.normalizeSettings({ url: "https://z.example", acknowledgement: "all", acknowledgedByMe: true }, "/home/u")
+assert.strictEqual(inertByMe.acknowledgedByMe, true)
+assert.strictEqual(inertByMe.acknowledgedByMeActive, false)
+assert.strictEqual(Model.normalizeSettings({ url: "https://z.example" }, "/home/u").acknowledgement, "all")
+assert.strictEqual(Model.normalizeSettings({ url: "https://z.example", acknowledgement: "nonsense" }, "/home/u").acknowledgement, "all")
 
 assert.strictEqual(Model.sha256(""), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
 assert.strictEqual(Model.sha256("abc"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
@@ -51,6 +63,17 @@ assert.strictEqual(signature.length, 64)
 assert.strictEqual(signature.indexOf("super-secret"), -1)
 assert.strictEqual(signature, Model.configurationSignature({ url: "https://z.example/", severities: [4, 5] }, "super-secret", "/home/u"))
 assert.notStrictEqual(signature, Model.configurationSignature({ url: "https://z.example", severities: "4,5" }, "rotated", "/home/u"))
+assert.notStrictEqual(
+  Model.configurationSignature({ url: "https://z.example", acknowledgement: "all" }, "super-secret", "/home/u"),
+  Model.configurationSignature({ url: "https://z.example", acknowledgement: "acknowledged" }, "super-secret", "/home/u"),
+  "the acknowledgement state changes the request and must split the shared group")
+assert.strictEqual(
+  Model.configurationSignature({ url: "https://z.example", acknowledgement: "all" }, "super-secret", "/home/u"),
+  Model.configurationSignature({ url: "https://z.example", acknowledgement: "All", acknowledgedByMe: true }, "super-secret", "/home/u"),
+  "an inert by-me checkbox must not split the shared group")
+assert.notStrictEqual(
+  Model.configurationSignature({ url: "https://z.example", acknowledgement: "acknowledged" }, "super-secret", "/home/u"),
+  Model.configurationSignature({ url: "https://z.example", acknowledgement: "acknowledged", acknowledgedByMe: true }, "super-secret", "/home/u"))
 assert.strictEqual(
   Model.dataSourceSignature({ url: "https://z.example", severities: [5] }, "super-secret", "/home/u"),
   Model.dataSourceSignature({ url: "https://z.example", severities: [1, 2] }, "super-secret", "/home/u"))
@@ -113,7 +136,7 @@ assert.strictEqual(Model.classifyCurlResult(0, "server\n" + Model.CURL_STATUS_MA
 assert.deepStrictEqual(Model.buildApiInfoVersionRequest(), {
   jsonrpc: "2.0", method: "apiinfo.version", params: {}, id: 1
 })
-assert.deepStrictEqual(Model.buildProblemGetRequest([5, 4, 5], 100), {
+assert.deepStrictEqual(Model.buildProblemGetRequest({ severities: [5, 4, 5], problemLimit: 100 }), {
   jsonrpc: "2.0",
   method: "problem.get",
   params: {
@@ -129,6 +152,30 @@ assert.deepStrictEqual(Model.buildProblemGetRequest([5, 4, 5], 100), {
   },
   id: 2
 })
+
+// The acknowledgement state maps onto problem.get's own filters.
+function problemParams(options) {
+  return Model.buildProblemGetRequest(options).params
+}
+assert.strictEqual(problemParams({ severities: [5], acknowledgement: "all" }).acknowledged, undefined)
+assert.strictEqual(problemParams({ severities: [5], acknowledgement: "unacknowledged" }).acknowledged, false)
+assert.strictEqual(problemParams({ severities: [5], acknowledgement: "Acknowledged" }).acknowledged, true)
+assert.strictEqual(problemParams({ severities: [5], acknowledgement: "acknowledged" }).action, undefined)
+var byMeParams = problemParams({ severities: [5], acknowledgement: "acknowledged", acknowledgedByUserId: "42" })
+assert.strictEqual(byMeParams.acknowledged, true)
+assert.strictEqual(byMeParams.action, Model.ACK_ACTION_ACKNOWLEDGE)
+assert.deepStrictEqual(byMeParams.action_userids, ["42"])
+// An unresolved or invalid user id drops the narrowing instead of guessing.
+assert.strictEqual(problemParams({ acknowledgement: "acknowledged", acknowledgedByUserId: "0" }).action, undefined)
+assert.strictEqual(problemParams({ acknowledgement: "acknowledged", acknowledgedByUserId: "" }).action_userids, undefined)
+// By-me never leaks into the other two states.
+assert.strictEqual(problemParams({ acknowledgement: "unacknowledged", acknowledgedByUserId: "42" }).action, undefined)
+assert.strictEqual(problemParams({ acknowledgement: "all", acknowledgedByUserId: "42" }).action, undefined)
+
+assert.deepStrictEqual(Model.buildUserCheckAuthenticationRequest("\n token-value \nignored", 4), {
+  jsonrpc: "2.0", method: "user.checkAuthentication", params: { token: "token-value" }, id: 4
+})
+assert.throws(function() { Model.buildUserCheckAuthenticationRequest(" \n") }, /API token is empty/)
 assert.deepStrictEqual(Model.buildTriggerGetRequest(["8", "7", "8", "bad"]), {
   jsonrpc: "2.0",
   method: "trigger.get",
@@ -153,6 +200,14 @@ assert.strictEqual(rejected.message.indexOf("super-secret"), -1)
 assert.strictEqual(Model.parseVersionResponse('{"jsonrpc":"2.0","result":"7.0.2","id":1}').ok, true)
 assert.strictEqual(Model.parseVersionResponse('{"jsonrpc":"2.0","result":"6.4.1","id":1}').category, "version")
 assert.strictEqual(Model.parseVersionResponse('{"jsonrpc":"2.0","result":"unknown","id":1}').category, "malformed-response")
+assert.strictEqual(Model.parseIdentityResponse('{"jsonrpc":"2.0","result":{"userid":"5","username":"ops"},"id":4}').userId, "5")
+assert.strictEqual(Model.parseIdentityResponse('{"jsonrpc":"2.0","result":{"username":"ops"},"id":4}').category, "malformed-response")
+assert.strictEqual(Model.parseIdentityResponse('{"jsonrpc":"2.0","result":[],"id":4}').category, "malformed-response")
+var identityDenied = Model.parseIdentityResponse(JSON.stringify({
+  jsonrpc: "2.0", id: 4, error: { code: -32602, message: "Invalid params.", data: 'No permissions to call "user.checkAuthentication". super-secret' }
+}), 4, ["super-secret"])
+assert.strictEqual(identityDenied.category, "permission")
+assert.strictEqual(identityDenied.message.indexOf("super-secret"), -1)
 assert.strictEqual(Model.classifyJsonRpcError({ code: -32500, data: "API token expired." }, "problem.get").category, "authentication")
 assert.strictEqual(Model.classifyJsonRpcError({ code: -32500, data: 'No permissions to call "trigger.get".' }, "trigger.get").category, "permission")
 
@@ -203,8 +258,37 @@ assert.strictEqual(Model.persistSeveritySelection([5, 1]), "1,5")
 assert.deepStrictEqual(Model.toggleSeverity([5], 5), [5], "the final severity cannot be removed")
 assert.deepStrictEqual(Model.toggleSeverity([4, 5], 4), [5])
 assert.strictEqual(Model.SEVERITIES.length, 6)
-assert.deepStrictEqual(Model.SEVERITIES[5], { value: 5, label: "Disaster", color: "#E45959" })
+assert.deepStrictEqual(Model.SEVERITIES[5], { value: 5, label: "Disaster", short: "Disaster", color: "#E45959" })
+// Every severity needs a short chip label, and it must not be longer than the
+// full one or the compact filter row gains nothing.
+Model.SEVERITIES.forEach(function(entry) {
+  assert.ok(entry.short && entry.short.length > 0)
+  assert.ok(entry.short.length <= entry.label.length)
+})
 assert.deepStrictEqual(Model.filterProblems(joined, [5]).map(function(p) { return p.eventId }), ["2", "3"])
+// Acknowledgement mirrors the server-side filter for carried-over payloads.
+// Event "2" is the acknowledged row in the fixture above.
+assert.deepStrictEqual(Model.filterProblems(joined, [0, 1, 2, 3, 4, 5], "acknowledged").map(function(p) { return p.eventId }), ["2"])
+assert.deepStrictEqual(Model.filterProblems(joined, [0, 1, 2, 3, 4, 5], "unacknowledged").map(function(p) { return p.eventId }), ["1", "3"])
+assert.strictEqual(Model.filterProblems(joined, [0, 1, 2, 3, 4, 5], "all").length, 3)
+assert.strictEqual(Model.filterProblems(joined, [0, 1, 2, 3, 4, 5]).length, 3)
+assert.deepStrictEqual(Model.filterProblems(joined, [4], "acknowledged").map(function(p) { return p.eventId }), [])
+assert.strictEqual(Model.severitySummary(joined, [0, 1, 2, 3, 4, 5], true, false, "unacknowledged").count, 1)
+assert.strictEqual(Model.severitySummary(joined, [0, 1, 2, 3, 4, 5], true, false, "unacknowledged").severity, 5)
+assert.strictEqual(Model.severitySummary(joined, [0, 1, 2, 3, 4, 5], true, false, "acknowledged").count, 1)
+assert.strictEqual(Model.highestSeveritySummary(joined, [4], { available: true, acknowledgement: "acknowledged" }).count, 0)
+
+assert.strictEqual(Model.parseAcknowledgement("Unacknowledged"), "unacknowledged")
+assert.strictEqual(Model.parseAcknowledgement("  ACK  "), "acknowledged")
+assert.strictEqual(Model.parseAcknowledgement("unack"), "unacknowledged")
+assert.strictEqual(Model.parseAcknowledgement(""), "all")
+assert.strictEqual(Model.parseAcknowledgement(undefined), "all")
+assert.strictEqual(Model.parseAcknowledgement("sometimes"), "all")
+assert.strictEqual(Model.persistAcknowledgement("ack"), "Acknowledged")
+assert.strictEqual(Model.persistAcknowledgement("nonsense"), "All")
+assert.strictEqual(Model.parseAcknowledgement(Model.persistAcknowledgement("unack")), "unacknowledged")
+assert.strictEqual(Model.ACKNOWLEDGEMENTS.length, 3)
+assert.deepStrictEqual(Model.ACKNOWLEDGEMENTS.map(function(entry) { return entry.value }), ["all", "unacknowledged", "acknowledged"])
 assert.deepStrictEqual(Model.sortProblems(joined).map(function(p) { return p.eventId }), ["2", "3", "1"])
 var summary = Model.highestSeveritySummary(joined, [0, 1, 2, 3, 4, 5], { available: true, truncated: true })
 assert.strictEqual(summary.severity, 5)
@@ -298,11 +382,52 @@ assert.ok(serviceSource.indexOf("onTokenChanged: scheduleConfigurationReload()")
 assert.ok(serviceSource.indexOf("command: Model.curlArgv()") >= 0)
 assert.ok(serviceSource.indexOf("id: watchdog") >= 0)
 assert.ok(serviceSource.indexOf("Model.beginTransaction(sharedBasePayload)") >= 0)
+// The identity call must stay unauthenticated: the token travels in the body.
+assert.ok(/startRequest\("identity",[^)]*, false\)/.test(serviceSource))
+assert.ok(serviceSource.indexOf('startRequest("problems", Model.buildProblemGetRequest({') >= 0)
+assert.ok(serviceSource.indexOf("acknowledgedByUserId: acknowledgedByMe ? resolvedUserId() : \"\"") >= 0)
 
 var panelSource = fs.readFileSync(path.join(__dirname, "..", "Panel.qml"), "utf8")
 assert.ok(panelSource.indexOf('moduleName: "dechnik.zabbix"') >= 0)
 assert.ok(panelSource.indexOf("updateEntryInline(moduleName, entry)") >= 0)
 assert.ok(panelSource.indexOf("function status(): string") >= 0)
 assert.strictEqual(panelSource.indexOf("zabbix.token"), -1)
+assert.ok(panelSource.indexOf("Model.ACKNOWLEDGEMENTS") >= 0)
+assert.ok(panelSource.indexOf("Model.persistAcknowledgement(next)") >= 0)
+// The by-me control must stay inert unless the acknowledged state is selected.
+assert.ok(panelSource.indexOf("enabled: root.acknowledgedByMeEnabled") >= 0)
+assert.ok(panelSource.indexOf('acknowledgedByMeEnabled: acknowledgement === "acknowledged"') >= 0)
+// Warnings and filters collapse so the problem list gets the panel's height,
+// and the disclosure state is panel-local: every open starts collapsed.
+assert.ok(panelSource.indexOf("component DisclosureHeader") >= 0)
+// Severity and acknowledgement live under one FILTERS disclosure, each row
+// captioned so the chips are not an unlabelled pile.
+assert.ok(panelSource.indexOf('text: "Severity"') >= 0)
+assert.ok(panelSource.indexOf('text: "Acknowledgement"') >= 0)
+assert.ok(panelSource.indexOf("component FilterGroupLabel") >= 0)
+assert.ok(/onOpenedChanged: if \(opened\) \{[^}]*noticesExpanded = false;[^}]*filtersExpanded = false;/.test(panelSource))
+// Progress state lives on the hero meta line, not in a banner.
+assert.strictEqual(panelSource.indexOf("Refreshing problems; the last complete result remains visible."), -1)
+assert.strictEqual(panelSource.indexOf("Waiting for the first problem refresh."), -1)
+
+var manifest = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "manifest.json"), "utf8"))
+assert.strictEqual(manifest.barWidget.defaults.acknowledgement, "All")
+assert.strictEqual(manifest.barWidget.defaults.acknowledgedByMe, false)
+var schemaKeys = manifest.barWidget.schema.map(function(field) { return field.key })
+// Disclosure state is panel-local, never a persisted setting.
+assert.strictEqual(schemaKeys.indexOf("filtersExpanded"), -1)
+assert.strictEqual(schemaKeys.indexOf("noticesExpanded"), -1)
+assert.ok(schemaKeys.indexOf("acknowledgement") >= 0)
+assert.ok(schemaKeys.indexOf("acknowledgedByMe") >= 0)
+manifest.barWidget.schema.forEach(function(field) {
+  if (field.key !== "acknowledgement") return
+  // The shell renders enum options as plain strings, so every option must
+  // survive a parse/persist round trip or the form and the panel disagree.
+  assert.strictEqual(field.type, "enum")
+  field.options.forEach(function(option) {
+    assert.strictEqual(Model.persistAcknowledgement(option), option)
+  })
+  assert.strictEqual(Model.persistAcknowledgement(field.defaultValue), field.defaultValue)
+})
 
 console.log("model: all assertions passed")
