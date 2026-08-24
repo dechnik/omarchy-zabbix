@@ -28,7 +28,8 @@
       "acknowledgement": "All",
       "acknowledgedByMe": false,
       "showSuppressed": true,
-      "showSymptoms": false
+      "showSymptoms": false,
+      "showUnmonitored": false
     },
     "schema": [
       {
@@ -121,6 +122,13 @@
         "label": "Include symptom problems",
         "defaultValue": false,
         "description": "Off lists only cause problems, so a symptom is not counted again beside its own cause."
+      },
+      {
+        "key": "showUnmonitored",
+        "type": "boolean",
+        "label": "Include disabled and unmonitored",
+        "defaultValue": false,
+        "description": "Zabbix keeps reporting problems for disabled triggers and unmonitored hosts; the frontend hides them and so does this. Turn on to audit what has been left switched off."
       }
     ]
   }

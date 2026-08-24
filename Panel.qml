@@ -35,6 +35,7 @@ Panel {
     readonly property bool acknowledgedByMeEnabled: acknowledgement === "acknowledged"
     readonly property bool showSuppressed: zabbix.showSuppressed
     readonly property bool showSymptoms: zabbix.showSymptoms
+    readonly property bool showUnmonitored: zabbix.showUnmonitored
     readonly property var visibleProblems: Model.sortProblems(Model.filterProblems(zabbix.problems, selectedSeverities, acknowledgement))
     readonly property var summary: Model.severitySummary(zabbix.problems, selectedSeverities, zabbix.hasData, zabbix.truncated, acknowledgement)
     readonly property int summaryCount: summaryNumber()
@@ -55,7 +56,8 @@ Panel {
     readonly property int acknowledgedByMeCursorIndex: acknowledgementCursorBase + Model.ACKNOWLEDGEMENTS.length
     readonly property int showSuppressedCursorIndex: acknowledgedByMeCursorIndex + 1
     readonly property int showSymptomsCursorIndex: showSuppressedCursorIndex + 1
-    readonly property int problemCursorBase: filtersExpanded ? showSymptomsCursorIndex + 1 : severityCursorBase
+    readonly property int showUnmonitoredCursorIndex: showSymptomsCursorIndex + 1
+    readonly property int problemCursorBase: filtersExpanded ? showUnmonitoredCursorIndex + 1 : severityCursorBase
     readonly property int cursorCount: problemCursorBase + visibleProblems.length
     readonly property string activityGlyph: zabbix.loading ? "󰑐" : (zabbix.stale ? "󰅖" : "")
     readonly property string barCount: summaryAvailable ? String(summaryCount) : "?"
@@ -200,6 +202,12 @@ Panel {
     function toggleShowSymptoms() {
         root.writeSettings({
             showSymptoms: !showSymptoms
+        });
+    }
+
+    function toggleShowUnmonitored() {
+        root.writeSettings({
+            showUnmonitored: !showUnmonitored
         });
     }
 
@@ -448,8 +456,12 @@ Panel {
             toggleShowSuppressed();
             return;
         }
-        if (cursorIndex === showSymptomsCursorIndex)
+        if (cursorIndex === showSymptomsCursorIndex) {
             toggleShowSymptoms();
+            return;
+        }
+        if (cursorIndex === showUnmonitoredCursorIndex)
+            toggleShowUnmonitored();
     }
 
     function setCursor(index) {
@@ -873,6 +885,13 @@ Panel {
                                 chosen: root.showSymptoms
                                 controlIndex: root.showSymptomsCursorIndex
                                 onToggled: root.toggleShowSymptoms()
+                            }
+
+                            IncludeControl {
+                                label: "Unmonitored"
+                                chosen: root.showUnmonitored
+                                controlIndex: root.showUnmonitoredCursorIndex
+                                onToggled: root.toggleShowUnmonitored()
                             }
                         }
                     }

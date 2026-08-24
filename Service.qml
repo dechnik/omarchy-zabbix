@@ -22,6 +22,7 @@ Item {
     readonly property bool acknowledgedByMe: normalized.acknowledgedByMeActive
     readonly property bool showSuppressed: normalized.showSuppressed
     readonly property bool showSymptoms: normalized.showSymptoms
+    readonly property bool showUnmonitored: normalized.showUnmonitored
     readonly property bool configured: normalized.endpoint !== "" && tokenFilePath !== ""
     readonly property bool hasData: lastUpdatedMs > 0
     readonly property string signature: Model.configurationSignature(settings, token, home)
@@ -47,7 +48,8 @@ Item {
     property int failureStreak: 0
 
     property var transaction: null
-    property var sweep: null
+    property var censusRows: null
+    property var rankResult: null
     property string requestPhase: ""
     property int requestGeneration: 0
     property int activeGeneration: 0
@@ -227,7 +229,8 @@ Item {
 
         activeClaimId = Shared.currentClaim(signature);
         transaction = Model.beginTransaction(sharedBasePayload);
-        sweep = null;
+        censusRows = null;
+        rankResult = null;
         if (force === true)
             identityError = "";
         loading = true;
@@ -260,7 +263,18 @@ Item {
         if (identityRequired())
             startIdentityRequest();
         else
-            startProblemsRequest();
+            startCensusRequest();
+    }
+
+    // Every phase hand-off waits a tick and re-checks that this refresh is still
+    // the current, owned one before continuing.
+    function continueWhenCurrent(step) {
+        var generation = activeGeneration;
+        var currentSignature = signature;
+        Qt.callLater(function () {
+            if (root.loading && root.activeGeneration === generation && root.signature === currentSignature && root.activeClaimId > 0)
+                step();
+        });
     }
 
     function startVersionRequest() {
@@ -275,28 +289,19 @@ Item {
             identityRequest = Model.buildUserCheckAuthenticationRequest(token, 4);
         } catch (exception) {
             identityError = Model.safeMessage(exception.message, [token]);
-            startProblemsRequest();
+            startCensusRequest();
             return;
         }
         startRequest("identity", identityRequest, false);
     }
 
-    function startProblemsRequest() {
-        sweep = Model.beginSeveritySweep(selectedSeverities, normalized.problemLimit);
-        startSweepStep();
-    }
-
-    // One problem.get per selected severity, Disaster first, until the row
-    // budget is spent. Usually two or three requests; six at the very most.
-    function startSweepStep() {
-        if (Model.sweepComplete(sweep)) {
-            finishProblems();
-            return;
-        }
+    // A refresh ranks before it fetches: census every matching problem cheaply,
+    // ask trigger.get which of them are still live, then pull full detail for
+    // the survivors that fit the limit.
+    function startCensusRequest() {
         connectionState = "fetch_problems";
-        startRequest("problems", Model.buildProblemGetRequest({
-            severities: [Model.sweepSeverity(sweep)],
-            rowLimit: Model.sweepRowLimit(sweep),
+        startRequest("census", Model.buildProblemCensusRequest({
+            severities: selectedSeverities,
             acknowledgement: acknowledgement,
             acknowledgedByUserId: acknowledgedByMe ? resolvedUserId() : "",
             showSuppressed: normalized.showSuppressed,
@@ -304,24 +309,25 @@ Item {
         }, 2), true);
     }
 
-    function finishProblems() {
-        Model.stageProblems(transaction, Model.normalizeProblemResult(sweep.rows, normalized.problemLimit));
-        sweep = null;
-        if (transaction.pendingProblems.length === 0) {
-            finishSuccess();
-            return;
-        }
-        var problemGeneration = activeGeneration;
-        var problemSignature = signature;
-        Qt.callLater(function () {
-            if (root.loading && root.activeGeneration === problemGeneration && root.signature === problemSignature && root.activeClaimId > 0)
-                root.startHostsRequest();
-        });
+    function startTriggersRequest() {
+        connectionState = "enrich_hosts";
+        startRequest("triggers", Model.buildTriggerGetRequest({
+            triggerIds: censusRows,
+            showUnmonitored: normalized.showUnmonitored
+        }, 3), true);
     }
 
-    function startHostsRequest() {
-        connectionState = "enrich_hosts";
-        startRequest("hosts", Model.buildTriggerGetRequest(transaction.pendingProblems, 3), true);
+    function startDetailRequest() {
+        connectionState = "fetch_problems";
+        startRequest("detail", Model.buildProblemDetailRequest(rankResult.eventIds, 5), true);
+    }
+
+    function finishWithoutProblems() {
+        Model.stageProblems(transaction, {
+            problems: [],
+            truncated: false
+        });
+        finishSuccess();
     }
 
     function startRequest(phase, rpcRequest, authenticated) {
@@ -377,11 +383,8 @@ Item {
             }
             serverVersion = versionResult.result;
             validatedSignature = signature;
-            var versionGeneration = activeGeneration;
-            var versionSignature = signature;
-            Qt.callLater(function () {
-                if (root.loading && root.activeGeneration === versionGeneration && root.signature === versionSignature && root.activeClaimId > 0)
-                    root.startNextDataRequest();
+            continueWhenCurrent(function () {
+                root.startNextDataRequest();
             });
             return;
         }
@@ -399,53 +402,86 @@ Item {
                 identityUserSignature = "";
                 identityError = identityResult.message || "Zabbix did not identify the API token's user";
             }
-            var identityGeneration = activeGeneration;
-            var identitySignature = signature;
-            Qt.callLater(function () {
-                if (root.loading && root.activeGeneration === identityGeneration && root.signature === identitySignature && root.activeClaimId > 0)
-                    root.startProblemsRequest();
+            continueWhenCurrent(function () {
+                root.startCensusRequest();
             });
             return;
         }
 
-        if (requestPhase === "problems") {
-            var problemResponse = Model.parseJsonRpcResponse(transport.body, 2, "problem.get", [token]);
-            if (!problemResponse.ok) {
-                failRefresh(problemResponse);
+        if (requestPhase === "census") {
+            var censusResponse = Model.parseJsonRpcResponse(transport.body, 2, "problem.get", [token]);
+            if (!censusResponse.ok) {
+                failRefresh(censusResponse);
                 return;
             }
-            if (!(problemResponse.result instanceof Array)) {
+            if (!(censusResponse.result instanceof Array)) {
                 failRefresh({
                     category: "malformed-response",
                     message: "Zabbix problem.get returned an invalid result"
                 });
                 return;
             }
-            Model.stageSweepRows(sweep, problemResponse.result);
-            var sweepGeneration = activeGeneration;
-            var sweepSignature = signature;
-            Qt.callLater(function () {
-                if (root.loading && root.activeGeneration === sweepGeneration && root.signature === sweepSignature && root.activeClaimId > 0)
-                    root.startSweepStep();
+            censusRows = Model.normalizeCensus(censusResponse.result);
+            if (censusRows.length === 0) {
+                Model.stageHosts(transaction, {});
+                finishWithoutProblems();
+                return;
+            }
+            continueWhenCurrent(function () {
+                root.startTriggersRequest();
             });
             return;
         }
 
-        if (requestPhase === "hosts") {
-            var hostResponse = Model.parseJsonRpcResponse(transport.body, 3, "trigger.get", [token]);
-            if (!hostResponse.ok) {
-                failRefresh(hostResponse);
+        if (requestPhase === "triggers") {
+            var triggerResponse = Model.parseJsonRpcResponse(transport.body, 3, "trigger.get", [token]);
+            if (!triggerResponse.ok) {
+                failRefresh(triggerResponse);
                 return;
             }
-            if (!(hostResponse.result instanceof Array)) {
+            if (!(triggerResponse.result instanceof Array)) {
                 failRefresh({
                     category: "malformed-response",
                     message: "Zabbix trigger.get returned an invalid result"
                 });
                 return;
             }
-            Model.stageHosts(transaction, Model.normalizeHosts(hostResponse.result));
+            var hostMap = Model.normalizeHosts(triggerResponse.result);
+            Model.stageHosts(transaction, hostMap);
+            rankResult = Model.rankCensus(censusRows, hostMap, {
+                problemLimit: normalized.problemLimit,
+                showUnmonitored: normalized.showUnmonitored
+            });
+            if (rankResult.eventIds.length === 0) {
+                finishWithoutProblems();
+                return;
+            }
+            continueWhenCurrent(function () {
+                root.startDetailRequest();
+            });
+            return;
+        }
+
+        if (requestPhase === "detail") {
+            var detailResponse = Model.parseJsonRpcResponse(transport.body, 5, "problem.get", [token]);
+            if (!detailResponse.ok) {
+                failRefresh(detailResponse);
+                return;
+            }
+            if (!(detailResponse.result instanceof Array)) {
+                failRefresh({
+                    category: "malformed-response",
+                    message: "Zabbix problem.get returned an invalid result"
+                });
+                return;
+            }
+            var detail = Model.normalizeProblemResult(detailResponse.result, normalized.problemLimit);
+            // Truncation is a property of the ranking, not of this response:
+            // detail only ever asks for what already fits the limit.
+            detail.truncated = rankResult.truncated;
+            Model.stageProblems(transaction, detail);
             finishSuccess();
+            return;
         }
     }
 
@@ -473,7 +509,8 @@ Item {
         payload.insecureTls = insecureTls;
         payload.identityError = identityError;
         transaction = null;
-        sweep = null;
+        censusRows = null;
+        rankResult = null;
         var claim = activeClaimId;
         activeClaimId = 0;
         if (Shared.publish(signature, payload, now, root, claim)) {
@@ -491,7 +528,8 @@ Item {
         var nextFailureStreak = Math.min(30, failureStreak + 1);
         var base = transaction ? transaction.published : sharedBasePayload;
         transaction = null;
-        sweep = null;
+        censusRows = null;
+        rankResult = null;
 
         if (joinedSignature !== "" && activeClaimId > 0) {
             var payload = copyPayload(base) || {
@@ -536,7 +574,8 @@ Item {
             Shared.abandon(joinedSignature, root, activeClaimId);
         activeClaimId = 0;
         transaction = null;
-        sweep = null;
+        censusRows = null;
+        rankResult = null;
         loading = false;
         requestGeneration += 1;
         activeGeneration = requestGeneration;

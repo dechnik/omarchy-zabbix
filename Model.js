@@ -14,6 +14,9 @@ var MAX_BACKOFF_MS = 900000
 var CLAIM_TIMEOUT_MS = 45000
 var CURL_STATUS_MARKER = "__ZABBIX_HTTP_STATUS__:"
 
+// The census asks only what ranking needs; detail is fetched for the survivors.
+var CENSUS_OUTPUT = ["eventid", "objectid", "severity", "clock"]
+
 var PROBLEM_OUTPUT = [
   "eventid", "objectid", "clock", "name", "severity",
   "acknowledged", "suppressed", "cause_eventid"
@@ -206,6 +209,9 @@ function normalizeSettings(settings, home) {
   // same incident counted twice.
   var showSuppressed = boolValue(source.showSuppressed, true)
   var showSymptoms = boolValue(source.showSymptoms, false)
+  // Zabbix keeps reporting problems for triggers and hosts somebody switched
+  // off. The frontend hides them; so does this, unless asked otherwise.
+  var showUnmonitored = boolValue(source.showUnmonitored, false)
   return {
     url: endpoint,
     endpoint: endpoint,
@@ -224,7 +230,8 @@ function normalizeSettings(settings, home) {
     // the configuration signature.
     acknowledgedByMeActive: acknowledgement === "acknowledged" && acknowledgedByMe,
     showSuppressed: showSuppressed,
-    showSymptoms: showSymptoms
+    showSymptoms: showSymptoms,
+    showUnmonitored: showUnmonitored
   }
 }
 
@@ -345,6 +352,7 @@ function configurationSignature(settings, token, home) {
     normalized.acknowledgedByMeActive ? "1" : "0",
     normalized.showSuppressed ? "1" : "0",
     normalized.showSymptoms ? "1" : "0",
+    normalized.showUnmonitored ? "1" : "0",
     sha256(text(token))
   ].join("\u0000")
   return sha256(material)
@@ -433,26 +441,22 @@ function buildApiInfoVersionRequest(id) {
   return request(id === undefined ? 1 : id, "apiinfo.version", {})
 }
 
-// `rowLimit` is the exact number of rows to ask for. The caller owns the
-// budget because a severity sweep spends it across several requests.
-function buildProblemGetRequest(options, id) {
+// Step one of a refresh: every problem matching the server-side filters, with
+// just enough output to rank them. No limit — the whole point is to see the
+// complete set before deciding what is worth fetching in full.
+function buildProblemCensusRequest(options, id) {
   var config = options || {}
-  var selected = parseSeveritySelection(config.severities)
-  var rowLimit = clampInteger(config.rowLimit, DEFAULT_PROBLEM_LIMIT + 1, 1, MAX_PROBLEM_LIMIT + 1)
   var acknowledgement = parseAcknowledgement(config.acknowledgement)
   var params = {
-    output: PROBLEM_OUTPUT.slice(),
-    selectTags: ["tag", "value"],
+    output: CENSUS_OUTPUT.slice(),
     source: 0,
     object: 0,
     recent: false,
-    severities: selected,
+    severities: parseSeveritySelection(config.severities),
     sortfield: ["eventid"],
-    sortorder: "DESC",
-    limit: rowLimit
+    sortorder: "DESC"
   }
-  // Omitting either flag is what returns both kinds; only the exclusions are
-  // worth sending.
+  // Omitting either flag is what returns both kinds; only exclusions are sent.
   if (config.showSuppressed === false) params.suppressed = false
   if (config.showSymptoms === false) params.symptom = false
   if (acknowledgement === "unacknowledged") params.acknowledged = false
@@ -467,6 +471,16 @@ function buildProblemGetRequest(options, id) {
     }
   }
   return request(id === undefined ? 2 : id, "problem.get", params)
+}
+
+// Step three: full detail for the ranked survivors, addressed by event id so
+// no filter can reinterpret the selection.
+function buildProblemDetailRequest(eventIds, id) {
+  return request(id === undefined ? 5 : id, "problem.get", {
+    output: PROBLEM_OUTPUT.slice(),
+    selectTags: ["tag", "value"],
+    eventids: uniqueIds(eventIds)
+  })
 }
 
 function buildUserCheckAuthenticationRequest(token, id) {
@@ -488,12 +502,19 @@ function uniqueIds(values) {
   return output
 }
 
-function buildTriggerGetRequest(triggerIds, id) {
-  return request(id === undefined ? 3 : id, "trigger.get", {
+// Step two: host names, and — the reason this runs before detail — which of
+// those triggers Zabbix still considers live. `monitored` keeps only enabled
+// triggers on monitored hosts with enabled items, which is what the frontend
+// shows and what problem.get alone will not tell you.
+function buildTriggerGetRequest(options, id) {
+  var config = options || {}
+  var params = {
     output: ["triggerid"],
-    triggerids: uniqueIds(triggerIds),
+    triggerids: uniqueIds(config.triggerIds),
     selectHosts: ["hostid", "name"]
-  })
+  }
+  if (config.showUnmonitored !== true) params.monitored = true
+  return request(id === undefined ? 3 : id, "trigger.get", params)
 }
 
 function requestBody(value) {
@@ -735,16 +756,7 @@ function filterProblems(problems, severities, acknowledgement) {
 
 function sortProblems(problems) {
   var output = (problems || []).slice()
-  output.sort(function(a, b) {
-    var severity = Number(b.severity) - Number(a.severity)
-    if (severity !== 0) return severity
-    var clock = Number(b.clock) - Number(a.clock)
-    if (clock !== 0) return clock
-    var left = text(a.eventId)
-    var right = text(b.eventId)
-    if (left === right) return 0
-    return left < right ? 1 : -1
-  })
+  output.sort(compareBySeverityThenRecency)
   return output
 }
 
@@ -819,46 +831,62 @@ function shouldClaimRefresh(group, nowMs, forced, freshnessMs) {
   return now - Number(state.publishedMs || 0) >= freshness
 }
 
-// problem.get can only sort by eventid, so asking for "the newest N" silently
-// drops older high-severity problems once the server has more than N matching.
-// Walk the selected severities from Disaster down instead, spending a shrinking
-// row budget, and stop as soon as it is full: what survives is the top N by
-// severity, and the highest present severity is always retrieved in full.
-function beginSeveritySweep(severities, problemLimit) {
-  var selected = parseSeveritySelection(severities).slice()
-  selected.sort(function(a, b) { return b - a })
-  return {
-    order: selected,
-    index: 0,
-    rows: [],
-    budget: clampInteger(problemLimit, DEFAULT_PROBLEM_LIMIT, MIN_PROBLEM_LIMIT, MAX_PROBLEM_LIMIT) + 1
-  }
+// problem.get cannot sort by severity and will happily report problems whose
+// trigger is disabled or whose host is unmonitored — the Zabbix frontend hides
+// those, so a bar that counts them is counting work nobody can act on. Ranking
+// therefore happens here, over the census joined to the live trigger set.
+function normalizeCensusRow(raw) {
+  if (!raw || typeof raw !== "object") return null
+  var eventId = idString(raw.eventid)
+  var triggerId = idString(raw.objectid)
+  var severity = Number(raw.severity)
+  if (eventId === "" || triggerId === "") return null
+  if (Math.floor(severity) !== severity || severity < 0 || severity > 5) return null
+  var clock = Number(raw.clock)
+  if (!isFinite(clock) || clock < 0) clock = 0
+  return { eventId: eventId, triggerId: triggerId, severity: severity, clock: Math.floor(clock) }
 }
 
-function sweepRowLimit(sweep) {
-  var state = sweep || {}
-  var budget = Number(state.budget) || 0
-  var taken = (state.rows || []).length
-  return Math.max(0, budget - taken)
-}
-
-function sweepComplete(sweep) {
-  var state = sweep || {}
-  if (!(state.order instanceof Array)) return true
-  if (Number(state.index) >= state.order.length) return true
-  return sweepRowLimit(state) <= 0
-}
-
-function sweepSeverity(sweep) {
-  if (sweepComplete(sweep)) return null
-  return sweep.order[sweep.index]
-}
-
-function stageSweepRows(sweep, rows) {
+function normalizeCensus(rows) {
   var source = rows instanceof Array ? rows : []
-  for (var i = 0; i < source.length; i++) sweep.rows.push(source[i])
-  sweep.index += 1
-  return sweep
+  var output = []
+  for (var i = 0; i < source.length; i++) {
+    var row = normalizeCensusRow(source[i])
+    if (row) output.push(row)
+  }
+  return output
+}
+
+function compareBySeverityThenRecency(a, b) {
+  var severity = Number(b.severity) - Number(a.severity)
+  if (severity !== 0) return severity
+  var clock = Number(b.clock) - Number(a.clock)
+  if (clock !== 0) return clock
+  var left = text(a.eventId)
+  var right = text(b.eventId)
+  if (left === right) return 0
+  return left < right ? 1 : -1
+}
+
+// A trigger absent from the enrichment result is disabled, on an unmonitored
+// host, or invisible. problem.get already applied the token's permissions to
+// this very set, so inside it the absence means "switched off".
+function rankCensus(census, hostMap, options) {
+  var config = options || {}
+  var limit = clampInteger(config.problemLimit, DEFAULT_PROBLEM_LIMIT, MIN_PROBLEM_LIMIT, MAX_PROBLEM_LIMIT)
+  var showUnmonitored = config.showUnmonitored === true
+  var map = hostMap || {}
+  var live = []
+  for (var i = 0; i < (census || []).length; i++) {
+    var row = census[i]
+    if (!row) continue
+    if (!showUnmonitored && !Object.prototype.hasOwnProperty.call(map, row.triggerId)) continue
+    live.push(row)
+  }
+  live.sort(compareBySeverityThenRecency)
+  var eventIds = []
+  for (var k = 0; k < live.length && eventIds.length < limit; k++) eventIds.push(live[k].eventId)
+  return { eventIds: eventIds, truncated: live.length > limit, total: live.length }
 }
 
 function beginTransaction(published) {
@@ -938,6 +966,7 @@ if (typeof module !== "undefined") {
     CURL_STATUS_MARKER: CURL_STATUS_MARKER,
     FETCH_SCRIPT: FETCH_SCRIPT,
     PROBLEM_OUTPUT: PROBLEM_OUTPUT,
+    CENSUS_OUTPUT: CENSUS_OUTPUT,
     SEVERITIES: SEVERITIES,
     ACKNOWLEDGEMENTS: ACKNOWLEDGEMENTS,
     ACK_ACTION_ACKNOWLEDGE: ACK_ACTION_ACKNOWLEDGE,
@@ -973,7 +1002,10 @@ if (typeof module !== "undefined") {
     curlArgv: curlArgv,
     buildCurlEnvironment: buildCurlEnvironment,
     buildApiInfoVersionRequest: buildApiInfoVersionRequest,
-    buildProblemGetRequest: buildProblemGetRequest,
+    buildProblemCensusRequest: buildProblemCensusRequest,
+    buildProblemDetailRequest: buildProblemDetailRequest,
+    normalizeCensus: normalizeCensus,
+    rankCensus: rankCensus,
     buildTriggerGetRequest: buildTriggerGetRequest,
     buildUserCheckAuthenticationRequest: buildUserCheckAuthenticationRequest,
     requestBody: requestBody,
@@ -1001,11 +1033,6 @@ if (typeof module !== "undefined") {
     failureBackoffMs: failureBackoffMs,
     backoffMs: failureBackoffMs,
     shouldClaimRefresh: shouldClaimRefresh,
-    beginSeveritySweep: beginSeveritySweep,
-    sweepRowLimit: sweepRowLimit,
-    sweepComplete: sweepComplete,
-    sweepSeverity: sweepSeverity,
-    stageSweepRows: stageSweepRows,
     beginTransaction: beginTransaction,
     stageProblems: stageProblems,
     stageHosts: stageHosts,

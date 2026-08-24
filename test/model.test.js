@@ -49,6 +49,8 @@ assert.strictEqual(normalized.acknowledgedByMe, true)
 assert.strictEqual(normalized.acknowledgedByMeActive, true)
 assert.strictEqual(normalized.showSuppressed, true, "suppressed problems have always been included")
 assert.strictEqual(normalized.showSymptoms, false, "a symptom beside its own cause is one incident counted twice")
+assert.strictEqual(normalized.showUnmonitored, false, "problems on switched-off triggers are not actionable")
+assert.strictEqual(Model.normalizeSettings({ showUnmonitored: "yes" }, "/h").showUnmonitored, true)
 assert.strictEqual(Model.normalizeSettings({ showSuppressed: "no", showSymptoms: "yes" }, "/h").showSuppressed, false)
 assert.strictEqual(Model.normalizeSettings({ showSuppressed: "no", showSymptoms: "yes" }, "/h").showSymptoms, true)
 
@@ -84,6 +86,9 @@ assert.notStrictEqual(
 assert.notStrictEqual(
   Model.configurationSignature({ url: "https://z.example" }, "super-secret", "/home/u"),
   Model.configurationSignature({ url: "https://z.example", showSymptoms: true }, "super-secret", "/home/u"))
+assert.notStrictEqual(
+  Model.configurationSignature({ url: "https://z.example" }, "super-secret", "/home/u"),
+  Model.configurationSignature({ url: "https://z.example", showUnmonitored: true }, "super-secret", "/home/u"))
 assert.strictEqual(
   Model.dataSourceSignature({ url: "https://z.example", severities: [5] }, "super-secret", "/home/u"),
   Model.dataSourceSignature({ url: "https://z.example", severities: [1, 2] }, "super-secret", "/home/u"))
@@ -146,33 +151,38 @@ assert.strictEqual(Model.classifyCurlResult(0, "server\n" + Model.CURL_STATUS_MA
 assert.deepStrictEqual(Model.buildApiInfoVersionRequest(), {
   jsonrpc: "2.0", method: "apiinfo.version", params: {}, id: 1
 })
-assert.deepStrictEqual(Model.buildProblemGetRequest({ severities: [5, 4, 5], rowLimit: 101 }), {
+assert.deepStrictEqual(Model.buildProblemCensusRequest({ severities: [5, 4, 5] }), {
   jsonrpc: "2.0",
   method: "problem.get",
   params: {
-    output: ["eventid", "objectid", "clock", "name", "severity", "acknowledged", "suppressed", "cause_eventid"],
-    selectTags: ["tag", "value"],
+    output: ["eventid", "objectid", "severity", "clock"],
     source: 0,
     object: 0,
     recent: false,
     severities: [4, 5],
     sortfield: ["eventid"],
-    sortorder: "DESC",
-    limit: 101
+    sortorder: "DESC"
   },
   id: 2
 })
+// The census is deliberately unlimited: ranking needs the whole set before it
+// can know which problems are worth fetching in full.
+assert.strictEqual(Model.buildProblemCensusRequest({}).params.limit, undefined)
 
-// The acknowledgement state maps onto problem.get's own filters.
+assert.deepStrictEqual(Model.buildProblemDetailRequest(["9", "8", "9", "bad", "0"]), {
+  jsonrpc: "2.0",
+  method: "problem.get",
+  params: {
+    output: ["eventid", "objectid", "clock", "name", "severity", "acknowledged", "suppressed", "cause_eventid"],
+    selectTags: ["tag", "value"],
+    eventids: ["9", "8"]
+  },
+  id: 5
+})
+
 function problemParams(options) {
-  return Model.buildProblemGetRequest(options).params
+  return Model.buildProblemCensusRequest(options).params
 }
-// rowLimit is verbatim: the sweep, not the builder, owns the budget.
-assert.strictEqual(problemParams({ rowLimit: 7 }).limit, 7)
-assert.strictEqual(problemParams({ rowLimit: 0 }).limit, 1)
-assert.strictEqual(problemParams({ rowLimit: 99999 }).limit, Model.MAX_PROBLEM_LIMIT + 1)
-assert.strictEqual(problemParams({}).limit, Model.DEFAULT_PROBLEM_LIMIT + 1)
-
 // Only the exclusions are sent; omitting a flag is what returns both kinds.
 assert.strictEqual(problemParams({ showSuppressed: true }).suppressed, undefined)
 assert.strictEqual(problemParams({ showSuppressed: false }).suppressed, false)
@@ -180,17 +190,15 @@ assert.strictEqual(problemParams({}).suppressed, undefined)
 assert.strictEqual(problemParams({ showSymptoms: true }).symptom, undefined)
 assert.strictEqual(problemParams({ showSymptoms: false }).symptom, false)
 assert.strictEqual(problemParams({}).symptom, undefined)
-assert.strictEqual(problemParams({ severities: [5], acknowledgement: "all" }).acknowledged, undefined)
-assert.strictEqual(problemParams({ severities: [5], acknowledgement: "unacknowledged" }).acknowledged, false)
-assert.strictEqual(problemParams({ severities: [5], acknowledgement: "Acknowledged" }).acknowledged, true)
-assert.strictEqual(problemParams({ severities: [5], acknowledgement: "acknowledged" }).action, undefined)
-var byMeParams = problemParams({ severities: [5], acknowledgement: "acknowledged", acknowledgedByUserId: "42" })
-assert.strictEqual(byMeParams.acknowledged, true)
+assert.strictEqual(problemParams({ acknowledgement: "all" }).acknowledged, undefined)
+assert.strictEqual(problemParams({ acknowledgement: "unacknowledged" }).acknowledged, false)
+assert.strictEqual(problemParams({ acknowledgement: "Acknowledged" }).acknowledged, true)
+assert.strictEqual(problemParams({ acknowledgement: "acknowledged" }).action, undefined)
+var byMeParams = problemParams({ acknowledgement: "acknowledged", acknowledgedByUserId: "42" })
 assert.strictEqual(byMeParams.action, Model.ACK_ACTION_ACKNOWLEDGE)
 assert.deepStrictEqual(byMeParams.action_userids, ["42"])
 // An unresolved or invalid user id drops the narrowing instead of guessing.
 assert.strictEqual(problemParams({ acknowledgement: "acknowledged", acknowledgedByUserId: "0" }).action, undefined)
-assert.strictEqual(problemParams({ acknowledgement: "acknowledged", acknowledgedByUserId: "" }).action_userids, undefined)
 // By-me never leaks into the other two states.
 assert.strictEqual(problemParams({ acknowledgement: "unacknowledged", acknowledgedByUserId: "42" }).action, undefined)
 assert.strictEqual(problemParams({ acknowledgement: "all", acknowledgedByUserId: "42" }).action, undefined)
@@ -199,12 +207,17 @@ assert.deepStrictEqual(Model.buildUserCheckAuthenticationRequest("\n token-value
   jsonrpc: "2.0", method: "user.checkAuthentication", params: { token: "token-value" }, id: 4
 })
 assert.throws(function() { Model.buildUserCheckAuthenticationRequest(" \n") }, /API token is empty/)
-assert.deepStrictEqual(Model.buildTriggerGetRequest(["8", "7", "8", "bad"]), {
+assert.deepStrictEqual(Model.buildTriggerGetRequest({ triggerIds: ["8", "7", "8", "bad"] }), {
   jsonrpc: "2.0",
   method: "trigger.get",
-  params: { output: ["triggerid"], triggerids: ["8", "7"], selectHosts: ["hostid", "name"] },
+  params: { output: ["triggerid"], triggerids: ["8", "7"], selectHosts: ["hostid", "name"], monitored: true },
   id: 3
 })
+// `monitored` is the whole reason this call runs before detail: problem.get
+// reports problems for disabled triggers and unmonitored hosts, trigger.get
+// is what reveals which ones Zabbix still considers live.
+assert.strictEqual(Model.buildTriggerGetRequest({ triggerIds: ["8"] }).params.monitored, true)
+assert.strictEqual(Model.buildTriggerGetRequest({ triggerIds: ["8"], showUnmonitored: true }).params.monitored, undefined)
 
 // JSON-RPC parsing and safe classification.
 assert.deepStrictEqual(Model.parseJsonRpcResponse('{"jsonrpc":"2.0","result":[],"id":2}', 2, "problem.get").result, [])
@@ -273,7 +286,7 @@ assert.deepStrictEqual(joined[1].hostNames, ["db-1", "db-2"])
 assert.strictEqual(joined[2].hostsAvailable, false)
 assert.strictEqual(joined[2].hostLabel, "Host unavailable")
 assert.strictEqual(joined.length, 3, "missing host enrichment must retain the problem")
-assert.deepStrictEqual(Model.buildTriggerGetRequest([]).params.triggerids, [])
+assert.deepStrictEqual(Model.buildTriggerGetRequest({ triggerIds: [] }).params.triggerids, [])
 
 assert.deepStrictEqual(Model.parseSeveritySelection("5,2,5,nope"), [2, 5])
 assert.deepStrictEqual(Model.parseSeveritySelection([]), [0, 1, 2, 3, 4, 5])
@@ -326,64 +339,76 @@ assert.strictEqual(Model.severitySummary(joined, [5], true, true).truncated, tru
 assert.strictEqual(Model.formatAge(1000, 1000 * 1000 + 5 * 60 * 1000), "5m ago")
 assert.strictEqual(Model.formatAge(0, 1000), "Unknown age")
 
-// Severity sweep: problem.get can only sort by eventid, so the retained set is
-// built highest-severity-first instead of newest-first.
-function runSweep(severities, problemLimit, available) {
-  var sweep = Model.beginSeveritySweep(severities, problemLimit)
-  var steps = []
-  var guard = 0
-  while (!Model.sweepComplete(sweep)) {
-    if (++guard > 20) throw new Error("sweep did not terminate")
-    var severity = Model.sweepSeverity(sweep)
-    var rowLimit = Model.sweepRowLimit(sweep)
-    steps.push({ severity: severity, rowLimit: rowLimit })
-    var take = Math.min(available[severity] || 0, rowLimit)
-    var rows = []
-    for (var i = 0; i < take; i++) {
-      rows.push({ eventid: String(severity * 10000 + i), objectid: "1", clock: "1", severity: String(severity) })
-    }
-    Model.stageSweepRows(sweep, rows)
-  }
-  return { steps: steps, sweep: sweep }
+// Census ranking. problem.get cannot sort by severity AND happily reports
+// problems whose trigger is disabled or whose host is unmonitored, so the
+// retained set is chosen here, from the census joined to the live trigger set.
+function censusRow(eventId, triggerId, severity, clock) {
+  return { eventid: eventId, objectid: triggerId, severity: String(severity), clock: String(clock) }
 }
 
-// The real distribution measured on a live 7.0.6 server: 227 problems, of which
-// only the top 100 by severity may be kept.
-var busy = runSweep([0, 1, 2, 3, 4, 5], 100, { 5: 1, 4: 25, 3: 83, 2: 63, 1: 39, 0: 16 })
-assert.deepStrictEqual(busy.steps, [
-  { severity: 5, rowLimit: 101 },
-  { severity: 4, rowLimit: 100 },
-  { severity: 3, rowLimit: 75 }
-], "Disaster first, and the budget shrinks by what each severity returned")
-var busyResult = Model.normalizeProblemResult(busy.sweep.rows, 100)
-assert.strictEqual(busyResult.problems.length, 100)
-assert.strictEqual(busyResult.truncated, true)
-assert.strictEqual(busyResult.problems[0].severity, 5, "the most severe problem survives the limit")
-assert.strictEqual(Model.filterProblems(busyResult.problems, [4]).length, 25, "every High is retained, not just the newest")
+var censusRaw = [
+  censusRow("1", "10", 2, 100),
+  censusRow("2", "77", 5, 900),   // Disaster on a disabled trigger
+  censusRow("3", "10", 4, 300),
+  censusRow("4", "20", 4, 400),
+  censusRow("5", "88", 4, 500),   // High on an unmonitored host
+  { eventid: "", objectid: "10", severity: "2" }
+]
+var censusRows = Model.normalizeCensus(censusRaw)
+assert.strictEqual(censusRows.length, 5, "malformed rows are dropped")
+assert.deepStrictEqual(censusRows[0], { eventId: "1", triggerId: "10", severity: 2, clock: 100 })
 
-// A quiet server never fills the budget, so it visits every selected severity
-// and reports no truncation.
-var quiet = runSweep([0, 1, 2, 3, 4, 5], 100, { 5: 0, 4: 2, 3: 3, 2: 0, 1: 1, 0: 0 })
-assert.deepStrictEqual(quiet.steps.map(function(step) { return step.severity }), [5, 4, 3, 2, 1, 0])
-assert.strictEqual(Model.normalizeProblemResult(quiet.sweep.rows, 100).truncated, false)
-assert.strictEqual(quiet.sweep.rows.length, 6)
+// trigger.get with monitored:true returned only 10 and 20; 77 and 88 are off.
+var liveHosts = Model.normalizeHosts([
+  { triggerid: "10", hosts: [{ hostid: "1", name: "web-1" }] },
+  { triggerid: "20", hosts: [{ hostid: "2", name: "db-1" }] }
+])
 
-// Deselected severities are never requested at all.
-var narrow = runSweep([4, 5], 100, { 5: 1, 4: 25, 3: 83 })
-assert.deepStrictEqual(narrow.steps.map(function(step) { return step.severity }), [5, 4])
+var ranked = Model.rankCensus(censusRows, liveHosts, { problemLimit: 100 })
+assert.deepStrictEqual(ranked.eventIds, ["4", "3", "1"], "severity desc, then newest, with dead triggers dropped")
+assert.strictEqual(ranked.total, 3)
+assert.strictEqual(ranked.truncated, false)
+assert.strictEqual(ranked.eventIds.indexOf("2"), -1, "a Disaster on a disabled trigger must not reach the bar")
+assert.strictEqual(ranked.eventIds.indexOf("5"), -1, "a High on an unmonitored host must not reach the bar")
 
-// A single severity that overflows the budget stops the sweep immediately.
-var flood = runSweep([0, 1, 2, 3, 4, 5], 10, { 5: 400 })
-assert.deepStrictEqual(flood.steps, [{ severity: 5, rowLimit: 11 }])
-assert.strictEqual(Model.normalizeProblemResult(flood.sweep.rows, 10).truncated, true)
+// Opting in brings the switched-off problems back, Disaster first.
+var withDead = Model.rankCensus(censusRows, liveHosts, { problemLimit: 100, showUnmonitored: true })
+assert.deepStrictEqual(withDead.eventIds, ["2", "5", "4", "3", "1"])
+assert.strictEqual(withDead.total, 5)
 
-// An empty sweep is complete and safe to interrogate.
-var emptySweep = Model.beginSeveritySweep([5], 0)
-assert.strictEqual(Model.sweepSeverity(emptySweep), 5)
-assert.strictEqual(Model.sweepComplete(null), true)
-assert.strictEqual(Model.sweepSeverity(null), null)
+// The limit keeps the most severe, and reports truncation from the live count.
+var capped = Model.rankCensus(censusRows, liveHosts, { problemLimit: 2 })
+assert.deepStrictEqual(capped.eventIds, ["4", "3"])
+assert.strictEqual(capped.truncated, true)
+assert.strictEqual(capped.total, 3)
 
-// Backoff and atomic refresh state.
+// Nothing live at all is a valid, non-truncated, empty result.
+var noneLive = Model.rankCensus(censusRows, {}, { problemLimit: 100 })
+assert.deepStrictEqual(noneLive.eventIds, [])
+assert.strictEqual(noneLive.truncated, false)
+assert.deepStrictEqual(Model.rankCensus(null, null, {}).eventIds, [])
+assert.deepStrictEqual(Model.normalizeCensus("nonsense"), [])
+
+// The real shape measured on a live 7.0.6 server: 228 problems reported by
+// problem.get, only 65 of them on triggers Zabbix still considers live.
+var bigCensus = []
+var bigHosts = {}
+var plan = [[5, 1, 1], [4, 25, 3], [3, 82, 6], [2, 65, 27], [1, 39, 21], [0, 16, 7]]
+var nextEvent = 1000
+for (var s = 0; s < plan.length; s++) {
+  for (var n = 0; n < plan[s][1]; n++) {
+    var triggerId = String(500000 + nextEvent)
+    bigCensus.push({ eventId: String(nextEvent), triggerId: triggerId, severity: plan[s][0], clock: nextEvent })
+    if (n < plan[s][2]) bigHosts[triggerId] = [{ hostId: "1", name: "host" }]
+    nextEvent += 1
+  }
+}
+var bigRank = Model.rankCensus(bigCensus, bigHosts, { problemLimit: 100 })
+assert.strictEqual(bigRank.total, 65, "228 reported, 65 actually live")
+assert.strictEqual(bigRank.truncated, false, "the live set no longer overflows the limit")
+assert.strictEqual(bigRank.eventIds.length, 65)
+
+// Backoff and atomic refresh state.// Backoff and atomic refresh state.
 assert.strictEqual(Model.failureBackoffMs(60, 0), 60000)
 assert.strictEqual(Model.failureBackoffMs(60, 1), 120000)
 assert.strictEqual(Model.failureBackoffMs(60, 20), Model.MAX_BACKOFF_MS)
@@ -464,23 +489,27 @@ assert.ok(serviceSource.indexOf("id: watchdog") >= 0)
 assert.ok(serviceSource.indexOf("Model.beginTransaction(sharedBasePayload)") >= 0)
 // The identity call must stay unauthenticated: the token travels in the body.
 assert.ok(/startRequest\("identity",[^)]*, false\)/.test(serviceSource))
-assert.ok(serviceSource.indexOf('startRequest("problems", Model.buildProblemGetRequest({') >= 0)
-// The sweep must drive the problem phase, one severity at a time.
-assert.ok(serviceSource.indexOf("Model.beginSeveritySweep(selectedSeverities, normalized.problemLimit)") >= 0)
-assert.ok(serviceSource.indexOf("severities: [Model.sweepSeverity(sweep)]") >= 0)
-assert.ok(serviceSource.indexOf("rowLimit: Model.sweepRowLimit(sweep)") >= 0)
-assert.ok(serviceSource.indexOf("Model.stageSweepRows(sweep, problemResponse.result)") >= 0)
-// A partial sweep must never leak into the next refresh, on any exit path.
+assert.ok(serviceSource.indexOf('startRequest("census", Model.buildProblemCensusRequest({') >= 0)
+assert.ok(serviceSource.indexOf('startRequest("triggers", Model.buildTriggerGetRequest({') >= 0)
+assert.ok(serviceSource.indexOf('startRequest("detail", Model.buildProblemDetailRequest(rankResult.eventIds, 5)') >= 0)
+// Liveness must be known before ranking, so trigger.get runs between the two
+// problem.get calls rather than after them.
+assert.ok(serviceSource.indexOf("Model.rankCensus(censusRows, hostMap, {") >= 0)
+assert.ok(serviceSource.indexOf("showUnmonitored: normalized.showUnmonitored") >= 0)
+assert.ok(serviceSource.indexOf("acknowledgedByUserId: acknowledgedByMe ? resolvedUserId() : \"\"") >= 0)
+// Truncation comes from the ranking; detail only ever asks for what fits.
+assert.ok(serviceSource.indexOf("detail.truncated = rankResult.truncated") >= 0)
+// Partial refresh state must never leak into the next one, on any exit path.
 function serviceFunctionBody(name) {
   var start = serviceSource.indexOf("function " + name + "(")
   assert.ok(start >= 0, name + " must exist in Service.qml")
   var next = serviceSource.indexOf("\n    function ", start + 1)
   return next < 0 ? serviceSource.slice(start) : serviceSource.slice(start, next)
 }
-["finishProblems", "finishSuccess", "failRefresh", "cancelRequest"].forEach(function(name) {
-  assert.ok(serviceFunctionBody(name).indexOf("sweep = null") >= 0, name + " must clear the sweep")
+["refresh", "finishSuccess", "failRefresh", "cancelRequest"].forEach(function(name) {
+  assert.ok(serviceFunctionBody(name).indexOf("censusRows = null") >= 0, name + " must clear the census")
+  assert.ok(serviceFunctionBody(name).indexOf("rankResult = null") >= 0, name + " must clear the ranking")
 })
-assert.ok(serviceSource.indexOf("acknowledgedByUserId: acknowledgedByMe ? resolvedUserId() : \"\"") >= 0)
 
 var panelSource = fs.readFileSync(path.join(__dirname, "..", "Panel.qml"), "utf8")
 assert.ok(panelSource.indexOf('moduleName: "dechnik.zabbix"') >= 0)
@@ -492,6 +521,7 @@ assert.ok(panelSource.indexOf("Model.persistAcknowledgement(next)") >= 0)
 // The by-me control must stay inert unless the acknowledged state is selected.
 assert.ok(panelSource.indexOf("enabled: root.acknowledgedByMeEnabled") >= 0)
 assert.ok(panelSource.indexOf('acknowledgedByMeEnabled: acknowledgement === "acknowledged"') >= 0)
+assert.ok(panelSource.indexOf('label: "Unmonitored"') >= 0)
 // Warnings and filters collapse so the problem list gets the panel's height,
 // and the disclosure state is panel-local: every open starts collapsed.
 assert.ok(panelSource.indexOf("component DisclosureHeader") >= 0)
@@ -516,6 +546,8 @@ assert.ok(schemaKeys.indexOf("showSuppressed") >= 0)
 assert.ok(schemaKeys.indexOf("showSymptoms") >= 0)
 assert.strictEqual(manifest.barWidget.defaults.showSuppressed, true)
 assert.strictEqual(manifest.barWidget.defaults.showSymptoms, false)
+assert.ok(schemaKeys.indexOf("showUnmonitored") >= 0)
+assert.strictEqual(manifest.barWidget.defaults.showUnmonitored, false)
 assert.ok(schemaKeys.indexOf("acknowledgement") >= 0)
 assert.ok(schemaKeys.indexOf("acknowledgedByMe") >= 0)
 manifest.barWidget.schema.forEach(function(field) {
