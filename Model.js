@@ -201,6 +201,11 @@ function normalizeSettings(settings, home) {
   var severities = parseSeveritySelection(source.severities)
   var acknowledgement = parseAcknowledgement(source.acknowledgement)
   var acknowledgedByMe = boolValue(source.acknowledgedByMe, false)
+  // Suppressed problems have always been included, so the default preserves it.
+  // Symptoms default to hidden: a symptom listed beside its own cause is the
+  // same incident counted twice.
+  var showSuppressed = boolValue(source.showSuppressed, true)
+  var showSymptoms = boolValue(source.showSymptoms, false)
   return {
     url: endpoint,
     endpoint: endpoint,
@@ -217,7 +222,9 @@ function normalizeSettings(settings, home) {
     // "Only acknowledged by me" refines the acknowledged state; it is inert on
     // the other two states, so only the effective flag reaches the request and
     // the configuration signature.
-    acknowledgedByMeActive: acknowledgement === "acknowledged" && acknowledgedByMe
+    acknowledgedByMeActive: acknowledgement === "acknowledged" && acknowledgedByMe,
+    showSuppressed: showSuppressed,
+    showSymptoms: showSymptoms
   }
 }
 
@@ -336,6 +343,8 @@ function configurationSignature(settings, token, home) {
     normalized.severitySetting,
     normalized.acknowledgement,
     normalized.acknowledgedByMeActive ? "1" : "0",
+    normalized.showSuppressed ? "1" : "0",
+    normalized.showSymptoms ? "1" : "0",
     sha256(text(token))
   ].join("\u0000")
   return sha256(material)
@@ -424,10 +433,12 @@ function buildApiInfoVersionRequest(id) {
   return request(id === undefined ? 1 : id, "apiinfo.version", {})
 }
 
+// `rowLimit` is the exact number of rows to ask for. The caller owns the
+// budget because a severity sweep spends it across several requests.
 function buildProblemGetRequest(options, id) {
   var config = options || {}
   var selected = parseSeveritySelection(config.severities)
-  var limit = clampInteger(config.problemLimit, DEFAULT_PROBLEM_LIMIT, MIN_PROBLEM_LIMIT, MAX_PROBLEM_LIMIT)
+  var rowLimit = clampInteger(config.rowLimit, DEFAULT_PROBLEM_LIMIT + 1, 1, MAX_PROBLEM_LIMIT + 1)
   var acknowledgement = parseAcknowledgement(config.acknowledgement)
   var params = {
     output: PROBLEM_OUTPUT.slice(),
@@ -438,8 +449,12 @@ function buildProblemGetRequest(options, id) {
     severities: selected,
     sortfield: ["eventid"],
     sortorder: "DESC",
-    limit: limit + 1
+    limit: rowLimit
   }
+  // Omitting either flag is what returns both kinds; only the exclusions are
+  // worth sending.
+  if (config.showSuppressed === false) params.suppressed = false
+  if (config.showSymptoms === false) params.symptom = false
   if (acknowledgement === "unacknowledged") params.acknowledged = false
   else if (acknowledgement === "acknowledged") {
     params.acknowledged = true
@@ -804,6 +819,48 @@ function shouldClaimRefresh(group, nowMs, forced, freshnessMs) {
   return now - Number(state.publishedMs || 0) >= freshness
 }
 
+// problem.get can only sort by eventid, so asking for "the newest N" silently
+// drops older high-severity problems once the server has more than N matching.
+// Walk the selected severities from Disaster down instead, spending a shrinking
+// row budget, and stop as soon as it is full: what survives is the top N by
+// severity, and the highest present severity is always retrieved in full.
+function beginSeveritySweep(severities, problemLimit) {
+  var selected = parseSeveritySelection(severities).slice()
+  selected.sort(function(a, b) { return b - a })
+  return {
+    order: selected,
+    index: 0,
+    rows: [],
+    budget: clampInteger(problemLimit, DEFAULT_PROBLEM_LIMIT, MIN_PROBLEM_LIMIT, MAX_PROBLEM_LIMIT) + 1
+  }
+}
+
+function sweepRowLimit(sweep) {
+  var state = sweep || {}
+  var budget = Number(state.budget) || 0
+  var taken = (state.rows || []).length
+  return Math.max(0, budget - taken)
+}
+
+function sweepComplete(sweep) {
+  var state = sweep || {}
+  if (!(state.order instanceof Array)) return true
+  if (Number(state.index) >= state.order.length) return true
+  return sweepRowLimit(state) <= 0
+}
+
+function sweepSeverity(sweep) {
+  if (sweepComplete(sweep)) return null
+  return sweep.order[sweep.index]
+}
+
+function stageSweepRows(sweep, rows) {
+  var source = rows instanceof Array ? rows : []
+  for (var i = 0; i < source.length; i++) sweep.rows.push(source[i])
+  sweep.index += 1
+  return sweep
+}
+
 function beginTransaction(published) {
   return {
     published: published || null,
@@ -944,6 +1001,11 @@ if (typeof module !== "undefined") {
     failureBackoffMs: failureBackoffMs,
     backoffMs: failureBackoffMs,
     shouldClaimRefresh: shouldClaimRefresh,
+    beginSeveritySweep: beginSeveritySweep,
+    sweepRowLimit: sweepRowLimit,
+    sweepComplete: sweepComplete,
+    sweepSeverity: sweepSeverity,
+    stageSweepRows: stageSweepRows,
     beginTransaction: beginTransaction,
     stageProblems: stageProblems,
     stageHosts: stageHosts,

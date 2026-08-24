@@ -47,6 +47,10 @@ assert.deepStrictEqual(normalized.severities, [2, 5])
 assert.strictEqual(normalized.acknowledgement, "acknowledged")
 assert.strictEqual(normalized.acknowledgedByMe, true)
 assert.strictEqual(normalized.acknowledgedByMeActive, true)
+assert.strictEqual(normalized.showSuppressed, true, "suppressed problems have always been included")
+assert.strictEqual(normalized.showSymptoms, false, "a symptom beside its own cause is one incident counted twice")
+assert.strictEqual(Model.normalizeSettings({ showSuppressed: "no", showSymptoms: "yes" }, "/h").showSuppressed, false)
+assert.strictEqual(Model.normalizeSettings({ showSuppressed: "no", showSymptoms: "yes" }, "/h").showSymptoms, true)
 
 // "Only acknowledged by me" is inert outside the acknowledged state.
 var inertByMe = Model.normalizeSettings({ url: "https://z.example", acknowledgement: "all", acknowledgedByMe: true }, "/home/u")
@@ -74,6 +78,12 @@ assert.strictEqual(
 assert.notStrictEqual(
   Model.configurationSignature({ url: "https://z.example", acknowledgement: "acknowledged" }, "super-secret", "/home/u"),
   Model.configurationSignature({ url: "https://z.example", acknowledgement: "acknowledged", acknowledgedByMe: true }, "super-secret", "/home/u"))
+assert.notStrictEqual(
+  Model.configurationSignature({ url: "https://z.example" }, "super-secret", "/home/u"),
+  Model.configurationSignature({ url: "https://z.example", showSuppressed: false }, "super-secret", "/home/u"))
+assert.notStrictEqual(
+  Model.configurationSignature({ url: "https://z.example" }, "super-secret", "/home/u"),
+  Model.configurationSignature({ url: "https://z.example", showSymptoms: true }, "super-secret", "/home/u"))
 assert.strictEqual(
   Model.dataSourceSignature({ url: "https://z.example", severities: [5] }, "super-secret", "/home/u"),
   Model.dataSourceSignature({ url: "https://z.example", severities: [1, 2] }, "super-secret", "/home/u"))
@@ -136,7 +146,7 @@ assert.strictEqual(Model.classifyCurlResult(0, "server\n" + Model.CURL_STATUS_MA
 assert.deepStrictEqual(Model.buildApiInfoVersionRequest(), {
   jsonrpc: "2.0", method: "apiinfo.version", params: {}, id: 1
 })
-assert.deepStrictEqual(Model.buildProblemGetRequest({ severities: [5, 4, 5], problemLimit: 100 }), {
+assert.deepStrictEqual(Model.buildProblemGetRequest({ severities: [5, 4, 5], rowLimit: 101 }), {
   jsonrpc: "2.0",
   method: "problem.get",
   params: {
@@ -157,6 +167,19 @@ assert.deepStrictEqual(Model.buildProblemGetRequest({ severities: [5, 4, 5], pro
 function problemParams(options) {
   return Model.buildProblemGetRequest(options).params
 }
+// rowLimit is verbatim: the sweep, not the builder, owns the budget.
+assert.strictEqual(problemParams({ rowLimit: 7 }).limit, 7)
+assert.strictEqual(problemParams({ rowLimit: 0 }).limit, 1)
+assert.strictEqual(problemParams({ rowLimit: 99999 }).limit, Model.MAX_PROBLEM_LIMIT + 1)
+assert.strictEqual(problemParams({}).limit, Model.DEFAULT_PROBLEM_LIMIT + 1)
+
+// Only the exclusions are sent; omitting a flag is what returns both kinds.
+assert.strictEqual(problemParams({ showSuppressed: true }).suppressed, undefined)
+assert.strictEqual(problemParams({ showSuppressed: false }).suppressed, false)
+assert.strictEqual(problemParams({}).suppressed, undefined)
+assert.strictEqual(problemParams({ showSymptoms: true }).symptom, undefined)
+assert.strictEqual(problemParams({ showSymptoms: false }).symptom, false)
+assert.strictEqual(problemParams({}).symptom, undefined)
 assert.strictEqual(problemParams({ severities: [5], acknowledgement: "all" }).acknowledged, undefined)
 assert.strictEqual(problemParams({ severities: [5], acknowledgement: "unacknowledged" }).acknowledged, false)
 assert.strictEqual(problemParams({ severities: [5], acknowledgement: "Acknowledged" }).acknowledged, true)
@@ -303,6 +326,63 @@ assert.strictEqual(Model.severitySummary(joined, [5], true, true).truncated, tru
 assert.strictEqual(Model.formatAge(1000, 1000 * 1000 + 5 * 60 * 1000), "5m ago")
 assert.strictEqual(Model.formatAge(0, 1000), "Unknown age")
 
+// Severity sweep: problem.get can only sort by eventid, so the retained set is
+// built highest-severity-first instead of newest-first.
+function runSweep(severities, problemLimit, available) {
+  var sweep = Model.beginSeveritySweep(severities, problemLimit)
+  var steps = []
+  var guard = 0
+  while (!Model.sweepComplete(sweep)) {
+    if (++guard > 20) throw new Error("sweep did not terminate")
+    var severity = Model.sweepSeverity(sweep)
+    var rowLimit = Model.sweepRowLimit(sweep)
+    steps.push({ severity: severity, rowLimit: rowLimit })
+    var take = Math.min(available[severity] || 0, rowLimit)
+    var rows = []
+    for (var i = 0; i < take; i++) {
+      rows.push({ eventid: String(severity * 10000 + i), objectid: "1", clock: "1", severity: String(severity) })
+    }
+    Model.stageSweepRows(sweep, rows)
+  }
+  return { steps: steps, sweep: sweep }
+}
+
+// The real distribution measured on a live 7.0.6 server: 227 problems, of which
+// only the top 100 by severity may be kept.
+var busy = runSweep([0, 1, 2, 3, 4, 5], 100, { 5: 1, 4: 25, 3: 83, 2: 63, 1: 39, 0: 16 })
+assert.deepStrictEqual(busy.steps, [
+  { severity: 5, rowLimit: 101 },
+  { severity: 4, rowLimit: 100 },
+  { severity: 3, rowLimit: 75 }
+], "Disaster first, and the budget shrinks by what each severity returned")
+var busyResult = Model.normalizeProblemResult(busy.sweep.rows, 100)
+assert.strictEqual(busyResult.problems.length, 100)
+assert.strictEqual(busyResult.truncated, true)
+assert.strictEqual(busyResult.problems[0].severity, 5, "the most severe problem survives the limit")
+assert.strictEqual(Model.filterProblems(busyResult.problems, [4]).length, 25, "every High is retained, not just the newest")
+
+// A quiet server never fills the budget, so it visits every selected severity
+// and reports no truncation.
+var quiet = runSweep([0, 1, 2, 3, 4, 5], 100, { 5: 0, 4: 2, 3: 3, 2: 0, 1: 1, 0: 0 })
+assert.deepStrictEqual(quiet.steps.map(function(step) { return step.severity }), [5, 4, 3, 2, 1, 0])
+assert.strictEqual(Model.normalizeProblemResult(quiet.sweep.rows, 100).truncated, false)
+assert.strictEqual(quiet.sweep.rows.length, 6)
+
+// Deselected severities are never requested at all.
+var narrow = runSweep([4, 5], 100, { 5: 1, 4: 25, 3: 83 })
+assert.deepStrictEqual(narrow.steps.map(function(step) { return step.severity }), [5, 4])
+
+// A single severity that overflows the budget stops the sweep immediately.
+var flood = runSweep([0, 1, 2, 3, 4, 5], 10, { 5: 400 })
+assert.deepStrictEqual(flood.steps, [{ severity: 5, rowLimit: 11 }])
+assert.strictEqual(Model.normalizeProblemResult(flood.sweep.rows, 10).truncated, true)
+
+// An empty sweep is complete and safe to interrogate.
+var emptySweep = Model.beginSeveritySweep([5], 0)
+assert.strictEqual(Model.sweepSeverity(emptySweep), 5)
+assert.strictEqual(Model.sweepComplete(null), true)
+assert.strictEqual(Model.sweepSeverity(null), null)
+
 // Backoff and atomic refresh state.
 assert.strictEqual(Model.failureBackoffMs(60, 0), 60000)
 assert.strictEqual(Model.failureBackoffMs(60, 1), 120000)
@@ -385,6 +465,21 @@ assert.ok(serviceSource.indexOf("Model.beginTransaction(sharedBasePayload)") >= 
 // The identity call must stay unauthenticated: the token travels in the body.
 assert.ok(/startRequest\("identity",[^)]*, false\)/.test(serviceSource))
 assert.ok(serviceSource.indexOf('startRequest("problems", Model.buildProblemGetRequest({') >= 0)
+// The sweep must drive the problem phase, one severity at a time.
+assert.ok(serviceSource.indexOf("Model.beginSeveritySweep(selectedSeverities, normalized.problemLimit)") >= 0)
+assert.ok(serviceSource.indexOf("severities: [Model.sweepSeverity(sweep)]") >= 0)
+assert.ok(serviceSource.indexOf("rowLimit: Model.sweepRowLimit(sweep)") >= 0)
+assert.ok(serviceSource.indexOf("Model.stageSweepRows(sweep, problemResponse.result)") >= 0)
+// A partial sweep must never leak into the next refresh, on any exit path.
+function serviceFunctionBody(name) {
+  var start = serviceSource.indexOf("function " + name + "(")
+  assert.ok(start >= 0, name + " must exist in Service.qml")
+  var next = serviceSource.indexOf("\n    function ", start + 1)
+  return next < 0 ? serviceSource.slice(start) : serviceSource.slice(start, next)
+}
+["finishProblems", "finishSuccess", "failRefresh", "cancelRequest"].forEach(function(name) {
+  assert.ok(serviceFunctionBody(name).indexOf("sweep = null") >= 0, name + " must clear the sweep")
+})
 assert.ok(serviceSource.indexOf("acknowledgedByUserId: acknowledgedByMe ? resolvedUserId() : \"\"") >= 0)
 
 var panelSource = fs.readFileSync(path.join(__dirname, "..", "Panel.qml"), "utf8")
@@ -417,6 +512,10 @@ var schemaKeys = manifest.barWidget.schema.map(function(field) { return field.ke
 // Disclosure state is panel-local, never a persisted setting.
 assert.strictEqual(schemaKeys.indexOf("filtersExpanded"), -1)
 assert.strictEqual(schemaKeys.indexOf("noticesExpanded"), -1)
+assert.ok(schemaKeys.indexOf("showSuppressed") >= 0)
+assert.ok(schemaKeys.indexOf("showSymptoms") >= 0)
+assert.strictEqual(manifest.barWidget.defaults.showSuppressed, true)
+assert.strictEqual(manifest.barWidget.defaults.showSymptoms, false)
 assert.ok(schemaKeys.indexOf("acknowledgement") >= 0)
 assert.ok(schemaKeys.indexOf("acknowledgedByMe") >= 0)
 manifest.barWidget.schema.forEach(function(field) {

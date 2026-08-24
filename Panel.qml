@@ -33,6 +33,8 @@ Panel {
     readonly property string acknowledgement: zabbix.acknowledgement
     readonly property bool acknowledgedByMe: zabbix.acknowledgedByMeSetting
     readonly property bool acknowledgedByMeEnabled: acknowledgement === "acknowledged"
+    readonly property bool showSuppressed: zabbix.showSuppressed
+    readonly property bool showSymptoms: zabbix.showSymptoms
     readonly property var visibleProblems: Model.sortProblems(Model.filterProblems(zabbix.problems, selectedSeverities, acknowledgement))
     readonly property var summary: Model.severitySummary(zabbix.problems, selectedSeverities, zabbix.hasData, zabbix.truncated, acknowledgement)
     readonly property int summaryCount: summaryNumber()
@@ -51,7 +53,9 @@ Panel {
     readonly property int severityCursorBase: filtersCursorIndex + 1
     readonly property int acknowledgementCursorBase: severityCursorBase + Model.SEVERITIES.length
     readonly property int acknowledgedByMeCursorIndex: acknowledgementCursorBase + Model.ACKNOWLEDGEMENTS.length
-    readonly property int problemCursorBase: filtersExpanded ? acknowledgedByMeCursorIndex + 1 : severityCursorBase
+    readonly property int showSuppressedCursorIndex: acknowledgedByMeCursorIndex + 1
+    readonly property int showSymptomsCursorIndex: showSuppressedCursorIndex + 1
+    readonly property int problemCursorBase: filtersExpanded ? showSymptomsCursorIndex + 1 : severityCursorBase
     readonly property int cursorCount: problemCursorBase + visibleProblems.length
     readonly property string activityGlyph: zabbix.loading ? "󰑐" : (zabbix.stale ? "󰅖" : "")
     readonly property string barCount: summaryAvailable ? String(summaryCount) : "?"
@@ -184,6 +188,18 @@ Panel {
             return;
         root.writeSettings({
             acknowledgement: Model.persistAcknowledgement(next)
+        });
+    }
+
+    function toggleShowSuppressed() {
+        root.writeSettings({
+            showSuppressed: !showSuppressed
+        });
+    }
+
+    function toggleShowSymptoms() {
+        root.writeSettings({
+            showSymptoms: !showSymptoms
         });
     }
 
@@ -424,8 +440,16 @@ Panel {
             setAcknowledgement(Model.ACKNOWLEDGEMENTS[cursorIndex - acknowledgementCursorBase].value);
             return;
         }
-        if (cursorIndex === acknowledgedByMeCursorIndex)
+        if (cursorIndex === acknowledgedByMeCursorIndex) {
             toggleAcknowledgedByMe();
+            return;
+        }
+        if (cursorIndex === showSuppressedCursorIndex) {
+            toggleShowSuppressed();
+            return;
+        }
+        if (cursorIndex === showSymptomsCursorIndex)
+            toggleShowSymptoms();
     }
 
     function setCursor(index) {
@@ -468,8 +492,10 @@ Panel {
             scrollItemIntoView(severityRepeater.itemAt(cursorIndex - severityCursorBase));
         else if (cursorIndex < acknowledgedByMeCursorIndex)
             scrollItemIntoView(acknowledgementGroup);
-        else
+        else if (cursorIndex === acknowledgedByMeCursorIndex)
             scrollItemIntoView(acknowledgedByMeControl);
+        else
+            scrollItemIntoView(includeRow);
     }
 
     implicitWidth: button.implicitWidth
@@ -823,6 +849,32 @@ Panel {
                             }
                             onClicked: root.toggleAcknowledgedByMe()
                         }
+
+                        FilterGroupLabel {
+                            x: filtersContent.indent
+                            topPadding: Style.space(6)
+                            text: "Include"
+                        }
+
+                        Row {
+                            id: includeRow
+                            x: filtersContent.indent
+                            spacing: Style.space(6)
+
+                            IncludeControl {
+                                label: "Suppressed"
+                                chosen: root.showSuppressed
+                                controlIndex: root.showSuppressedCursorIndex
+                                onToggled: root.toggleShowSuppressed()
+                            }
+
+                            IncludeControl {
+                                label: "Symptoms"
+                                chosen: root.showSymptoms
+                                controlIndex: root.showSymptomsCursorIndex
+                                onToggled: root.toggleShowSymptoms()
+                            }
+                        }
                     }
 
                     PanelSeparator {
@@ -990,6 +1042,32 @@ Panel {
             wrapMode: Text.WordWrap
             verticalAlignment: Text.AlignVCenter
         }
+    }
+
+    component IncludeControl: Button {
+        property string label: ""
+        property bool chosen: false
+        property int controlIndex: 0
+
+        signal toggled
+
+        text: label
+        iconText: chosen ? "󰄬" : ""
+        selected: chosen
+        bordered: true
+        hasCursor: root.cursorActive && root.cursorIndex === controlIndex
+        foreground: root.foreground
+        fontFamily: root.fontFamily
+        fontSize: Style.font.bodySmall
+        iconSize: Style.font.bodySmall
+        horizontalPadding: Style.space(8)
+        verticalPadding: Style.space(5)
+
+        onHovered: function (hovered) {
+            if (hovered)
+                root.setCursor(controlIndex);
+        }
+        onClicked: toggled()
     }
 
     component SeverityControl: Button {

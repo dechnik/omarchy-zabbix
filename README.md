@@ -9,9 +9,15 @@ names, age, acknowledgment, and suppression state.
 
 The bar number is deliberately **not the total problem count**. From the
 retrieved problems that match the selected severity and acknowledgment
-filters, the plugin finds
-the highest numeric severity and counts only problems at exactly that
-severity. Lower-severity problems are not added.
+filters, the plugin finds the highest numeric severity and counts only problems
+at exactly that severity. Lower-severity problems are not added.
+
+That count is exact rather than a side effect of how many problems were
+fetched. `problem.get` can only sort by event id, so asking for "the newest
+`problemLimit`" would silently drop older high-severity problems on a busy
+server. The plugin instead retrieves one severity at a time, Disaster first,
+until `problemLimit` is filled, so the most severe problems can never fall
+outside the window.
 
 For example, one Disaster, three High, and seven Warning problems produce a red
 Disaster icon and `1`, not `11`. Four High problems with nothing at Disaster
@@ -134,6 +140,8 @@ are persisted in the widget entry in `~/.config/omarchy/shell.json` and hot-relo
 | `severities` | `["0", "1", "2", "3", "4", "5"]` | One or more of `0` Not classified, `1` Information, `2` Warning, `3` Average, `4` High, `5` Disaster. The panel will not remove the final selected severity. |
 | `acknowledgement` | `"All"` | `All`, `Unacknowledged`, or `Acknowledged`. Case-insensitive; `any`, `unack`, and `ack` are accepted from the CLI. Anything else normalizes to `All`. |
 | `acknowledgedByMe` | `false` | `true` narrows `Acknowledged` to problems **you** acknowledged. Inert on `All` and `Unacknowledged`, where the panel control is dimmed. Needs `user.checkAuthentication`. |
+| `showSuppressed` | `true` | Include problems suppressed by maintenance, listed with a `SUPPRESSED` badge. `false` sends `suppressed: false` to Zabbix. |
+| `showSymptoms` | `false` | Include symptom problems. The default lists only cause problems, so a symptom is not counted a second time beside its own cause. `true` omits the filter and returns both. |
 
 Examples:
 
@@ -143,6 +151,8 @@ omarchy bar set dechnik.zabbix problemLimit 250
 omarchy bar set dechnik.zabbix severities 4,5
 omarchy bar set dechnik.zabbix acknowledgement Unacknowledged
 omarchy bar set dechnik.zabbix acknowledgedByMe true
+omarchy bar set dechnik.zabbix showSuppressed false
+omarchy bar set dechnik.zabbix showSymptoms true
 omarchy bar set dechnik.zabbix tokenFile '~/.config/omarchy/zabbix/token'
 ```
 
@@ -194,6 +204,7 @@ omarchy bar set dechnik.zabbix insecureTls false
 | Click a severity | Include or exclude it; the final selected severity cannot be removed. |
 | Click an acknowledgement state | Show `All`, `Unacknowledged`, or `Acknowledged` problems. |
 | Click *only acknowledged by me* | Narrow `Acknowledged` to your own acknowledgements. Dimmed and inert on the other two states. |
+| Click *Suppressed* or *Symptoms* | Include or exclude those problems; both are server-side filters. |
 | Click a problem row | Move the panel cursor to that read-only row. |
 
 ### Panel Layout
@@ -204,8 +215,9 @@ under one `FILTERS` row; both start collapsed every time the panel opens and
 expand on click or `Enter`. The collapsed state is panel-local — it is not a
 setting and is never written to `shell.json`.
 
-Expanding `FILTERS` reveals both control groups under captions, `Severity`
-first and `Acknowledgement` below it. The six severity chips use short labels
+Expanding `FILTERS` reveals three captioned control groups: `Severity`,
+`Acknowledgement`, and `Include` (suppressed and symptom problems). The six
+severity chips use short labels
 (`NC`, `Info`, `Warn`, `Avg`, `High`, `Disaster`) to fit one row; hover a chip
 for the full severity name.
 
@@ -227,8 +239,8 @@ suppressed problems; it never changes Zabbix state.
 
 | Key | Action |
 |---|---|
-| `Up` / `Down` or `j` / `k` | Move through the warnings row, the `FILTERS` row, and problem rows. While `FILTERS` is expanded the six severity controls, the three acknowledgement controls, and the *only acknowledged by me* control join the path between them. |
-| `Enter` | Expand or collapse the focused warnings or `FILTERS` row, toggle the focused severity, select the focused acknowledgement state, or toggle *only acknowledged by me*. Problem rows have no activation action. |
+| `Up` / `Down` or `j` / `k` | Move through the warnings row, the `FILTERS` row, and problem rows. While `FILTERS` is expanded the six severity controls, the three acknowledgement controls, *only acknowledged by me*, and the two *Include* controls join the path between them. |
+| `Enter` | Expand or collapse the focused warnings or `FILTERS` row, toggle the focused severity or *Include* control, select the focused acknowledgement state, or toggle *only acknowledged by me*. Problem rows have no activation action. |
 | `r` | Request an immediate refresh. |
 | `Esc` | Close the panel. |
 | `Tab` / `Shift+Tab` | Switch to the next/previous panel in the same bar section and monitor. |
@@ -268,20 +280,32 @@ equal configurations share polling state and published data across monitors.
 
 ## Limits And Refresh Behavior
 
-- Each `problem.get` asks for `problemLimit + 1` newest matching unresolved
-  trigger problems. The severity and acknowledgement filters are applied by
-  Zabbix, not locally, so the limit is spent only on problems you asked to see.
-  The extra row detects truncation and is discarded; at most `problemLimit`
-  valid problems are displayed.
+- A refresh spends a budget of `problemLimit + 1` rows across one `problem.get`
+  per selected severity, highest first, stopping as soon as the budget is full.
+  A server with a Disaster, 25 High and 83 Average problems and the default
+  limit therefore issues three requests — Disaster, High, Average — and never
+  asks about Warning, Information, or Not classified. Six requests is the
+  worst case; two or three is typical.
+- What survives is the `problemLimit` **most severe** problems, matching a
+  Zabbix dashboard Problems widget sorted by severity descending. It is not the
+  newest `problemLimit`: `problem.get` cannot sort by severity, and a newest-N
+  window hides older high-severity problems once a server has more matching
+  problems than the limit.
+- The severity, acknowledgement, suppressed, and symptom filters are all
+  applied by Zabbix, not locally, so the limit is spent only on problems you
+  asked to see. The extra row detects truncation and is discarded; at most
+  `problemLimit` valid problems are displayed.
 - When the extra row exists, the panel warns that more matching problems may
   exist and IPC status includes `truncated`. Counts and filters then describe
   only the retained result, never a server-wide total.
 - The first configured load is immediate. Later successful polling uses
   `refreshIntervalSec`. Equivalent monitor instances coordinate one polling
   sequence per effective configuration rather than polling once per monitor.
-- A refresh is atomic: version checking, `problem.get`, and, when needed,
-  batched `trigger.get` host enrichment must complete before replacing the
-  published result. During refresh, the last complete result stays visible.
+- A refresh is atomic: version checking, every `problem.get` in the severity
+  sweep, and, when needed, batched `trigger.get` host enrichment must all
+  complete before replacing the published result. A sweep that fails partway
+  through publishes nothing. During refresh, the last complete result stays
+  visible.
 - With *only acknowledged by me* enabled, one `user.checkAuthentication` runs
   between the version check and `problem.get`. The resulting user id is cached
   for as long as the endpoint and token are unchanged. A failure is cached too,

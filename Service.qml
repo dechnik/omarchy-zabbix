@@ -20,6 +20,8 @@ Item {
     // panel can show it ticked while the acknowledgement state renders it inert.
     readonly property bool acknowledgedByMeSetting: normalized.acknowledgedByMe
     readonly property bool acknowledgedByMe: normalized.acknowledgedByMeActive
+    readonly property bool showSuppressed: normalized.showSuppressed
+    readonly property bool showSymptoms: normalized.showSymptoms
     readonly property bool configured: normalized.endpoint !== "" && tokenFilePath !== ""
     readonly property bool hasData: lastUpdatedMs > 0
     readonly property string signature: Model.configurationSignature(settings, token, home)
@@ -45,6 +47,7 @@ Item {
     property int failureStreak: 0
 
     property var transaction: null
+    property var sweep: null
     property string requestPhase: ""
     property int requestGeneration: 0
     property int activeGeneration: 0
@@ -224,6 +227,7 @@ Item {
 
         activeClaimId = Shared.currentClaim(signature);
         transaction = Model.beginTransaction(sharedBasePayload);
+        sweep = null;
         if (force === true)
             identityError = "";
         loading = true;
@@ -278,13 +282,41 @@ Item {
     }
 
     function startProblemsRequest() {
+        sweep = Model.beginSeveritySweep(selectedSeverities, normalized.problemLimit);
+        startSweepStep();
+    }
+
+    // One problem.get per selected severity, Disaster first, until the row
+    // budget is spent. Usually two or three requests; six at the very most.
+    function startSweepStep() {
+        if (Model.sweepComplete(sweep)) {
+            finishProblems();
+            return;
+        }
         connectionState = "fetch_problems";
         startRequest("problems", Model.buildProblemGetRequest({
-            severities: selectedSeverities,
-            problemLimit: normalized.problemLimit,
+            severities: [Model.sweepSeverity(sweep)],
+            rowLimit: Model.sweepRowLimit(sweep),
             acknowledgement: acknowledgement,
-            acknowledgedByUserId: acknowledgedByMe ? resolvedUserId() : ""
+            acknowledgedByUserId: acknowledgedByMe ? resolvedUserId() : "",
+            showSuppressed: normalized.showSuppressed,
+            showSymptoms: normalized.showSymptoms
         }, 2), true);
+    }
+
+    function finishProblems() {
+        Model.stageProblems(transaction, Model.normalizeProblemResult(sweep.rows, normalized.problemLimit));
+        sweep = null;
+        if (transaction.pendingProblems.length === 0) {
+            finishSuccess();
+            return;
+        }
+        var problemGeneration = activeGeneration;
+        var problemSignature = signature;
+        Qt.callLater(function () {
+            if (root.loading && root.activeGeneration === problemGeneration && root.signature === problemSignature && root.activeClaimId > 0)
+                root.startHostsRequest();
+        });
     }
 
     function startHostsRequest() {
@@ -389,17 +421,13 @@ Item {
                 });
                 return;
             }
-            Model.stageProblems(transaction, Model.normalizeProblemResult(problemResponse.result, normalized.problemLimit));
-            if (transaction.pendingProblems.length === 0)
-                finishSuccess();
-            else {
-                var problemGeneration = activeGeneration;
-                var problemSignature = signature;
-                Qt.callLater(function () {
-                    if (root.loading && root.activeGeneration === problemGeneration && root.signature === problemSignature && root.activeClaimId > 0)
-                        root.startHostsRequest();
-                });
-            }
+            Model.stageSweepRows(sweep, problemResponse.result);
+            var sweepGeneration = activeGeneration;
+            var sweepSignature = signature;
+            Qt.callLater(function () {
+                if (root.loading && root.activeGeneration === sweepGeneration && root.signature === sweepSignature && root.activeClaimId > 0)
+                    root.startSweepStep();
+            });
             return;
         }
 
@@ -445,6 +473,7 @@ Item {
         payload.insecureTls = insecureTls;
         payload.identityError = identityError;
         transaction = null;
+        sweep = null;
         var claim = activeClaimId;
         activeClaimId = 0;
         if (Shared.publish(signature, payload, now, root, claim)) {
@@ -462,6 +491,7 @@ Item {
         var nextFailureStreak = Math.min(30, failureStreak + 1);
         var base = transaction ? transaction.published : sharedBasePayload;
         transaction = null;
+        sweep = null;
 
         if (joinedSignature !== "" && activeClaimId > 0) {
             var payload = copyPayload(base) || {
@@ -506,6 +536,7 @@ Item {
             Shared.abandon(joinedSignature, root, activeClaimId);
         activeClaimId = 0;
         transaction = null;
+        sweep = null;
         loading = false;
         requestGeneration += 1;
         activeGeneration = requestGeneration;
