@@ -59,7 +59,8 @@ Panel {
     readonly property int showUnmonitoredCursorIndex: showSymptomsCursorIndex + 1
     readonly property int problemCursorBase: filtersExpanded ? showUnmonitoredCursorIndex + 1 : severityCursorBase
     readonly property int cursorCount: problemCursorBase + visibleProblems.length
-    readonly property string activityGlyph: zabbix.loading ? "󰑐" : (zabbix.stale ? "󰅖" : "")
+    // Refreshing is routine background noise; only stale data earns a bar glyph.
+    readonly property string activityGlyph: zabbix.stale ? "󰅖" : ""
     readonly property string barCount: summaryAvailable ? String(summaryCount) : "?"
 
     function summaryNumber() {
@@ -224,10 +225,16 @@ Panel {
         return isFinite(value) ? value : -1;
     }
 
+    // Crossing Service's `property var problems` turns the nested host arrays
+    // into QVariantList wrappers, which fail Array.isArray while still
+    // indexing like an array — so this counts rather than type-checks.
     function hostsText(problem) {
-        var hosts = problem && Array.isArray(problem.hosts) ? problem.hosts : [];
+        var hosts = problem && problem.hosts ? problem.hosts : [];
+        var count = Number(hosts.length);
+        if (!isFinite(count) || count < 0)
+            count = 0;
         var names = [];
-        for (var i = 0; i < hosts.length; i++) {
+        for (var i = 0; i < count; i++) {
             var host = hosts[i];
             var name = typeof host === "string" ? host : String(host && (host.name || host.host) || "");
             if (name !== "")
@@ -322,8 +329,6 @@ Panel {
             parts.push("No matching Zabbix problems");
         else
             parts.push(summaryCount + " " + severityLabel(summarySeverity) + " problem" + (summaryCount === 1 ? "" : "s"));
-        if (zabbix.loading)
-            parts.push("refreshing");
         if (zabbix.stale)
             parts.push("stale");
         if (zabbix.truncated)
@@ -574,7 +579,7 @@ Panel {
         labelVisible: false
         fixedWidth: root.vertical ? -1 : horizontalBarContent.implicitWidth + scaledHorizontalMargin * 2
         fixedHeight: root.vertical ? Style.bar.iconSlot * 2 : -1
-        dimmed: !root.summaryAvailable || zabbix.loading || zabbix.stale
+        dimmed: !root.summaryAvailable || zabbix.stale
         tooltipText: root.barTooltip()
 
         onPressed: function (code) {

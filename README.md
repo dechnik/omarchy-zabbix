@@ -209,7 +209,7 @@ omarchy bar set dechnik.zabbix insecureTls false
 |---|---|
 | Left click the bar widget | Toggle the problem panel. |
 | Right click the bar widget | Request an immediate refresh without opening the panel. |
-| Hover the bar widget | Show the highest-severity summary and loading, stale, truncation, or insecure-TLS state. |
+| Hover the bar widget | Show the highest-severity summary and stale, truncation, or insecure-TLS state. |
 | Click the panel refresh button | Request an immediate refresh. |
 | Click the warnings row | Expand or collapse the full warning text. |
 | Click `FILTERS` | Expand or collapse the severity and acknowledgement controls. |
@@ -235,9 +235,11 @@ for the full severity name.
 
 Two exceptions to the collapsing: an unconfigured widget forces its setup
 notice open, because a bare `⚠ 1 warning` would hide the only thing worth
-saying. Refresh progress gets no banner at all — the header meta line already
-reads `Connecting`, `Loading problems`, or `Waiting for data`, and the bar
-carries the activity glyph.
+saying. Refresh progress gets no banner at all — and no bar indication
+either: a poll every `refreshIntervalSec` is background noise, not a state to
+act on. The header meta line still reads `Connecting`, `Loading problems`, or
+`Waiting for data` while the panel is open, and the bar carries a glyph only
+for stale data.
 
 The list is sorted by severity descending, then newest first. Severity and
 acknowledgement changes are persisted, immediately filter the last published
