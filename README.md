@@ -1,16 +1,31 @@
 # Zabbix Problems for Omarchy
 
 `dechnik.zabbix` is an Omarchy Quattro bar widget for unresolved Zabbix
-trigger problems. It keeps the most severe visible state in the bar and opens a
-read-only, severity- and acknowledgment-filterable problem list with host
-names, age, acknowledgment, and suppression state.
+trigger problems, from one server or several. It keeps the most severe visible
+state in the bar and opens a read-only, server-, severity- and
+acknowledgment-filterable problem list with host names, age, acknowledgment,
+and suppression state. Servers are added and edited in the panel itself.
+
+![The collapsed panel: a hero line with connection state and freshness, then nothing but the problem list, sorted by severity and colour-coded per row.](preview.png)
+
+Collapsed, the panel is only the header and the problem list — nothing competes
+with problems for space.
+
+![The expanded panel: a WARNINGS banner about disabled TLS verification, a SERVERS section with one server's editor open over its name, URL, token file and CA certificate fields, then the FILTERS groups for severity, acknowledgement and include.](preview2.png)
+
+Expanded (the header button, or `e`), it adds warnings, the server editor, the
+filters, and the refresh interval above the still-visible problem list. The
+`Server` filter group appears alongside `Severity` once a second server is
+configured; with one, as here, there is nothing to choose between.
 
 ## Bar Summary
 
 The bar number is deliberately **not the total problem count**. From the
-retrieved problems that match the selected severity and acknowledgment
+retrieved problems that match the selected server, severity, and acknowledgment
 filters, the plugin finds the highest numeric severity and counts only problems
-at exactly that severity. Lower-severity problems are not added.
+at exactly that severity. Lower-severity problems are not added. With several
+servers configured the highest severity is taken across all selected ones, so
+the bar shows the worst thing happening anywhere.
 
 Only problems the Zabbix frontend would show are counted. `problem.get` keeps
 reporting problems whose trigger has been disabled or whose host is no longer
@@ -28,7 +43,9 @@ For example, one Disaster, three High, and seven Warning problems produce a red
 Disaster icon and `1`, not `11`. Four High problems with nothing at Disaster
 produce a High icon and `4`. A successful result with no matching problems
 shows a neutral `0`; no successful result yet shows a neutral `?` instead of a
-false healthy zero. A truncated result can make the displayed count incomplete.
+false healthy zero. A truncated result can make the displayed count incomplete,
+and so can a server that has not answered — that case keeps the count from the
+servers that did and marks it stale rather than falling back to `?`.
 
 ## Requirements
 
@@ -125,26 +142,53 @@ it reloads the token without restarting the shell. Keep it owned by your user
 and at mode `0600`; the plugin relies on this setup and does not enforce the
 mode itself.
 
+Each configured server has its own token file, so a second server needs a
+second file — the default path is only a default, and two servers pointed at
+the same file would authenticate to both with the same token.
+
+## Servers
+
+Servers are configured **in the panel**, not in the widget settings form: the
+form renders flat scalar fields and has no way to express a list of servers.
+Open the panel, press `e` (or the Expand button), and use the `SERVERS`
+section. Click a server to open its editor, which holds:
+
+| Field | Meaning |
+|---|---|
+| Name | Optional label. Falls back to the URL's host, then to `Server N`. |
+| Zabbix URL | HTTPS frontend root or full `api_jsonrpc.php` URL. Required. |
+| API token file | Path whose first non-empty line is that server's token. `~` and `~/` are expanded. |
+| Custom CA certificate | Optional PEM CA certificate/trust anchor for a private CA or self-signed server. |
+| Disable TLS verification | Unsafe per-server fallback. Prefer a custom CA certificate. |
+
+*Add server* appends an entry; *Remove* inside an open editor deletes it. Each
+server is polled independently on the shared refresh interval, and their
+problems are merged into one list and one bar count. Two servers configured
+identically share a single fetch rather than polling twice.
+
+The list is stored as `servers` in the widget entry in
+`~/.config/omarchy/shell.json`, with `selectedServers` holding the ids the
+server filter currently includes. Both hot-reload.
+
+A configuration written before this list existed — a top-level `url`,
+`tokenFile`, `caCertificateFile`, and `insecureTls` — is still read as a single
+unnamed server, so `omarchy bar set dechnik.zabbix url ...` keeps working for a
+one-server setup. The first time the panel writes the server list it drops
+those four keys, leaving `servers` as the only source of truth.
+
 ## Configure
 
-Set the HTTPS frontend/API URL after enabling the widget:
-
-```bash
-omarchy bar set dechnik.zabbix url 'https://zabbix.example.com/zabbix'
-```
-
-Settings can be changed in the widget settings or with
-`omarchy bar set dechnik.zabbix <key> <value>`. The plugin normalizes numeric
-and boolean strings written by this command. For severities, use a comma-separated
-CLI value; the settings UI may store the equivalent array. Non-secret settings
-are persisted in the widget entry in `~/.config/omarchy/shell.json` and hot-reload.
+The remaining settings are global across every server. They can be changed in
+the widget settings or with `omarchy bar set dechnik.zabbix <key> <value>`. The
+plugin normalizes numeric and boolean strings written by this command. For
+severities, use a comma-separated CLI value; the settings UI may store the
+equivalent array. Non-secret settings are persisted in the widget entry in
+`~/.config/omarchy/shell.json` and hot-reload.
 
 | Key | Default | Allowed values and behavior |
 |---|---|---|
-| `url` | `""` | HTTPS frontend root or full `api_jsonrpc.php` URL. Required. |
-| `tokenFile` | `"~/.config/omarchy/zabbix/token"` | Path whose first non-empty line is the token. `~` and `~/` are expanded. |
-| `caCertificateFile` | `""` | Optional path to a PEM CA certificate/trust anchor for a private CA or self-signed server. |
-| `insecureTls` | `false` | `true` explicitly disables certificate and hostname verification. |
+| `servers` | `[]` | Array of `{id, name, url, tokenFile, caCertificateFile, insecureTls}`. Edited in the panel's `SERVERS` section; see above. |
+| `selectedServers` | `[]` | Ids the server filter includes. Empty means every server. Unknown ids are dropped, and the last selected server cannot be deselected. |
 | `refreshIntervalSec` | `60` | Integer from `15` to `3600`; settings UI step `15`. |
 | `problemLimit` | `100` | Integer from `1` to `1000`; settings UI step `25`. |
 | `severities` | `["0", "1", "2", "3", "4", "5"]` | One or more of `0` Not classified, `1` Information, `2` Warning, `3` Average, `4` High, `5` Disaster. The panel will not remove the final selected severity. |
@@ -165,7 +209,6 @@ omarchy bar set dechnik.zabbix acknowledgedByMe true
 omarchy bar set dechnik.zabbix showSuppressed false
 omarchy bar set dechnik.zabbix showSymptoms true
 omarchy bar set dechnik.zabbix showUnmonitored true
-omarchy bar set dechnik.zabbix tokenFile '~/.config/omarchy/zabbix/token'
 ```
 
 Values outside numeric ranges are clamped by the runtime. Invalid or empty
@@ -174,34 +217,26 @@ severity selections normalize to all six severities, and an unrecognized
 
 ## TLS
 
-Certificate and hostname verification are enabled by default.
+Certificate and hostname verification are enabled by default, per server.
 
 For a certificate issued by the system trust store, no additional setting is
 needed. For a private CA or a self-signed server, store the issuing CA PEM (or
 the self-signed server certificate used as its own trust anchor) locally and
-configure it:
+put its path in that server's **Custom CA certificate** field in the panel's
+`SERVERS` section.
 
-```bash
-omarchy bar set dechnik.zabbix caCertificateFile '~/.config/omarchy/zabbix/private-ca.pem'
-```
+The certificate still has to match the hostname in that server's URL. Prefer
+this mode to disabling verification.
 
-The certificate still has to match the hostname in `url`. Prefer this mode to
-disabling verification.
+Insecure mode is an explicit last resort: the **Disable TLS verification**
+toggle in the same editor. It is equivalent to accepting any server certificate
+and disables hostname verification. A man-in-the-middle can impersonate Zabbix
+and intercept the API token and monitoring data. The toggle paints itself in
+the urgent color, the panel raises a warning naming the server, and the status
+output stays marked `insecure-tls` while it is on. Turn it off after diagnosis.
 
-Insecure mode is an explicit last resort:
-
-```bash
-omarchy bar set dechnik.zabbix insecureTls true
-```
-
-This is equivalent to accepting any server certificate and disables hostname
-verification. A man-in-the-middle can impersonate Zabbix and intercept the API
-token and monitoring data. The panel and status output remain visibly marked
-as insecure while this setting is active. Turn it off after diagnosis:
-
-```bash
-omarchy bar set dechnik.zabbix insecureTls false
-```
+Verification is per server, so disabling it for a lab server does not weaken a
+production one configured beside it.
 
 ## Bar And Panel
 
@@ -211,7 +246,10 @@ omarchy bar set dechnik.zabbix insecureTls false
 | Right click the bar widget | Request an immediate refresh without opening the panel. |
 | Hover the bar widget | Show the highest-severity summary and stale, truncation, or insecure-TLS state. |
 | Click the panel refresh button | Request an immediate refresh. |
-| Click the panel Expand/Compact button | Show or hide the warnings, filters, and more-options sections alongside the problem list. |
+| Click the panel Expand/Compact button | Show or hide the warnings, servers, filters, and more-options sections alongside the problem list. |
+| Click a server row | Open or close that server's editor. |
+| Click *Add server* / *Remove* | Add a server to poll, or delete the open one. |
+| Click a server chip | Include or exclude that server; shown only with more than one configured, and the final selected server cannot be removed. |
 | Click a severity | Include or exclude it; the final selected severity cannot be removed. |
 | Click an acknowledgement state | Show `All`, `Unacknowledged`, or `Acknowledged` problems. |
 | Click *only acknowledged by me* | Narrow `Acknowledged` to your own acknowledgements. Dimmed and inert on the other two states. |
@@ -224,29 +262,49 @@ The normal panel shows only the header and the problem list — nothing else
 competes with problems for space. An Expand button in the header (or the `e`
 key) grows the panel and reveals, above the still-visible problem list: a
 `WARNINGS` section (only present when there is something to say), a
-`FILTERS` section, and a `MORE OPTIONS` section reserved for future
-settings. A Compact button (or `e` again) shrinks the panel back to
-problems-only. This expand state is panel-local — it is not a setting and is
-never written to `shell.json`, and it resets to collapsed every time the
-panel opens.
+`SERVERS` section, a `FILTERS` section, and a `MORE OPTIONS` section holding
+the refresh interval. A Compact button (or `e` again) shrinks the panel back
+to problems-only. This expand state is panel-local — it is not a setting and
+is never written to `shell.json`, and it resets to collapsed every time the
+panel opens, along with any open server editor.
 
-The `FILTERS` section has three captioned control groups: `Severity`,
-`Acknowledgement`, and `Include` (suppressed, symptom, and unmonitored
-problems). The six severity chips use short labels
-(`NC`, `Info`, `Warn`, `Avg`, `High`, `Disaster`) to fit one row; hover a chip
-for the full severity name.
+The `SERVERS` section lists one row per configured server: a status dot, its
+label, and its URL. Clicking a row opens its editor as an accordion — one at a
+time — with the fields described under [Servers](#servers). The status dot is
+accented when that server has data, urgent when its last refresh failed, and
+dim while it is unconfigured or still connecting.
 
-One exception to starting collapsed: an unconfigured widget opens already
-expanded, because a bare header would hide the only thing worth saying — its
-setup notice. Refresh progress gets no banner at all — and no bar indication
+The `FILTERS` section has four captioned control groups: `Server`,
+`Severity`, `Acknowledgement`, and `Include` (suppressed, symptom, and
+unmonitored problems). `Server` appears only once more than one server is
+configured — with a single server there is nothing to choose between. The six
+severity chips use short labels (`NC`, `Info`, `Warn`, `Avg`, `High`,
+`Disaster`) to fit one row; hover a chip for the full severity name.
+
+One exception to starting collapsed: a widget with no configured server opens
+already expanded, because a bare header would hide the only thing worth saying
+— that a server has to be added. Refresh progress gets no banner at all — and no bar indication
 either: a poll every `refreshIntervalSec` is background noise, not a state to
 act on. The header meta line still reads `Connecting`, `Loading problems`, or
 `Waiting for data` while the panel is open, and the bar carries a glyph only
 for stale data.
 
-The list is sorted by severity descending, then newest first. Severity and
-acknowledgement changes are persisted, immediately filter the last published
-result, and trigger a new server-filtered request. *Only acknowledged by me* is
+Problems from every selected server are merged into one list, sorted by
+severity descending and then newest first, so the worst problem is at the top
+regardless of which server reported it. With more than one server configured
+each row carries its server's label beside the age. Warnings name their server
+too — an unprefixed "refresh failed" would not say where to go and fix it.
+
+The header meta line and the bar count aggregate the selected servers. If one
+server answers and another does not, the count from the servers that did
+answer is still shown, marked `Partial data` and carrying the stale glyph,
+rather than blanking the bar: a single dead server should not hide the
+problems the others reported. The `Zabbix <version>` part of the meta line is
+replaced by an `N/M servers connected` tally once more than one is configured,
+because a merged list has no single version to name.
+
+Severity, acknowledgement, and server changes are persisted, immediately
+filter the last published result, and trigger a new server-filtered request. *Only acknowledged by me* is
 the exception: it has no client-side equivalent because a published problem
 records no acknowledging user, so it applies once the new result arrives. The
 panel shows all visible hosts returned by Zabbix and marks acknowledged and
@@ -258,12 +316,17 @@ on, matching what the Zabbix frontend lists.
 
 | Key | Action |
 |---|---|
-| `Up` / `Down` or `j` / `k` | Move through problem rows. While the panel is expanded, the six severity controls, the three acknowledgement controls, *only acknowledged by me*, and the three *Include* controls join the path before the problem rows. |
-| `Enter` | While expanded: toggle the focused severity or *Include* control, select the focused acknowledgement state, or toggle *only acknowledged by me*. Problem rows have no activation action. |
-| `e` | Expand or collapse the panel. |
-| `r` | Request an immediate refresh. |
-| `Esc` | Close the panel. |
-| `Tab` / `Shift+Tab` | Switch to the next/previous panel in the same bar section and monitor. |
+| `Up` / `Down` or `j` / `k` | Move through problem rows. While the panel is expanded the path runs in drawing order first: each server row, *Add server*, the server chips (with more than one server), the six severity controls, the three acknowledgement controls, *only acknowledged by me*, the three *Include* controls, and the refresh interval. An open server editor inserts its *Disable TLS verification* and *Remove* stops directly after its own row. |
+| `Enter` | While expanded: open or close the focused server editor, activate *Add server* / *Remove*, toggle the focused server chip, severity, *Include*, or TLS control, select the focused acknowledgement state, toggle *only acknowledged by me*, or focus the refresh interval field. Problem rows have no activation action. |
+| `e` | Expand or collapse the panel. Inert while a text field has focus. |
+| `r` | Request an immediate refresh. Inert while a text field has focus. |
+| `Esc` | Leave the focused text field, or close the panel when none has focus. |
+| `Tab` / `Shift+Tab` | Switch to the next/previous panel in the same bar section and monitor. While a server field has focus, moves between that editor's fields instead. |
+
+A focused text field or the refresh-interval spin box owns the keyboard while
+it has focus, so `j`, `k`, `e`, and `r` type rather than navigate. `Enter` or
+`Esc` hands the keyboard back to the panel; `Enter` commits the field and
+`Esc` reverts it.
 
 ## IPC
 
@@ -279,12 +342,14 @@ omarchy-shell dechnik.zabbix refresh
 omarchy-shell dechnik.zabbix status
 ```
 
-`show` is an alias of `open`; `hide` is an alias of `close`; `refresh` returns
-`ok`. `status` returns a sanitized one-line state such as
-`zabbix severity=high count=3 ack=all version=7.0.0 age=12s` and may add
-`stale`, `refreshing`, `truncated`, `ack-by-me`, `identity-unavailable`, or
-`insecure-tls`. It does not include the endpoint, token, problem names, or host
-names.
+`show` is an alias of `open`; `hide` is an alias of `close`; `refresh` refreshes
+every configured server and returns `ok`. `status` returns a sanitized one-line
+state such as
+`zabbix servers=2 selected=2 severity=high count=3 ack=all age=12s` and may add
+`failing=N`, `partial`, `stale`, `refreshing`, `truncated`, `ack-by-me`,
+`identity-unavailable`, or `insecure-tls`. `version=` appears only when exactly
+one server is selected, since a merged list has no single version. It does not
+include any endpoint, token, server name, problem name, or host name.
 
 On a multi-monitor bar, use the shell router for a panel-toggle hotkey:
 
@@ -296,7 +361,9 @@ This shell-level form chooses the already-open copy first, otherwise the copy
 on Hyprland's focused monitor. A direct `dechnik.zabbix toggle` targets the
 per-monitor IPC handler that registered that target and is not the reliable
 focused-monitor route. Direct `refresh` and `status` are still suitable because
-equal configurations share polling state and published data across monitors.
+equal configurations share polling state and published data across monitors —
+which is per server: two servers configured identically share one fetch, and a
+server's poll is shared across every monitor showing the widget.
 
 ## Limits And Refresh Behavior
 
@@ -325,13 +392,21 @@ equal configurations share polling state and published data across monitors.
 - The first configured load is immediate. Later successful polling uses
   `refreshIntervalSec`. Equivalent monitor instances coordinate one polling
   sequence per effective configuration rather than polling once per monitor.
+- Each configured server runs its own refresh sequence, ranking and truncation
+  included, and `problemLimit` applies per server rather than to the merged
+  list. Backoff, staleness, and errors are per server too, so a failing server
+  slows only itself. The coordination above is keyed on the effective
+  configuration, so two servers configured identically share a single fetch.
+- The freshness shown in the header is the **oldest** contributing server's,
+  not the newest, so an "Updated 10s ago" cannot hide a server that last
+  answered ten minutes ago.
 - A refresh is atomic: version checking, the census, the `trigger.get` join,
   and the detail fetch must all complete before replacing the published result.
   A refresh that fails partway through publishes nothing. During refresh, the
   last complete result stays visible.
 - With *only acknowledged by me* enabled, one `user.checkAuthentication` runs
-  between the version check and `problem.get`. The resulting user id is cached
-  for as long as the endpoint and token are unchanged. A failure is cached too,
+  between the version check and `problem.get`, per server. The resulting user
+  id is cached for as long as that server's endpoint and token are unchanged. A failure is cached too,
   so a denied method does not add a failing call to every poll; pressing `r`
   clears it and retries.
 - After a failed refresh, a previous complete result stays visible and is
@@ -348,8 +423,9 @@ equal configurations share polling state and published data across monitors.
 
 ## Security Model
 
-- The token is never written to `shell.json`, process arguments, IPC status,
-  plugin logs, or user-visible errors. Error text is sanitized and bounded.
+- No token is ever written to `shell.json`, process arguments, IPC status,
+  plugin logs, or user-visible errors. `shell.json` records only each server's
+  token file **path**. Error text is sanitized and bounded, per server.
 - Authenticated requests pass the token to a short-lived Bash process through
   `ZABBIX_TOKEN`; Bash feeds the Bearer header to curl through curl config on
   standard input. `/proc/<pid>/cmdline` therefore does not contain the token.
@@ -367,9 +443,11 @@ equal configurations share polling state and published data across monitors.
   File mode `0600` protects against other ordinary local users; it does not
   protect against that trust boundary.
 
-Use a dedicated least-privilege token, review enabled plugins, keep TLS
-verification on, and revoke/rotate the token if the account or machine may be
-compromised.
+Use a dedicated least-privilege token per server, review enabled plugins, keep
+TLS verification on, and revoke/rotate a token if the account or machine may be
+compromised. Give each server its own token file: one file shared by two
+servers authenticates to both with the same secret, so revoking it for one
+revokes it for both.
 
 ## Troubleshooting
 
@@ -381,19 +459,30 @@ omarchy plugin list
 omarchy-shell dechnik.zabbix status
 ```
 
+Every warning in the expanded panel names the server it came from once more
+than one is configured, and `servers=N` plus `failing=N` in `status` says how
+many are configured and how many are currently failing. Start there to tell
+which server a symptom belongs to; `status` deliberately does not name it.
+
 - **Setup or endpoint:** `setup-required`, `endpoint`, or a URL message means
-  `url` is empty/invalid, is not HTTPS, contains credentials/query/fragment, or
-  points somewhere other than the frontend root or `api_jsonrpc.php`.
-- **Token file or authentication:** Confirm the configured path, owner, mode
-  `0600`, and first non-empty line. Rotate an expired/revoked token. The watched
-  file normally reloads automatically.
+  a server's URL is empty/invalid, is not HTTPS, contains
+  credentials/query/fragment, or points somewhere other than the frontend root
+  or `api_jsonrpc.php`. The offending URL is repeated under the field in that
+  server's editor.
+- **Token file or authentication:** Confirm that server's configured path,
+  owner, mode `0600`, and first non-empty line. Rotate an expired/revoked
+  token. The watched file normally reloads automatically.
+- **`partial`:** Some selected servers answered and some did not. The count is
+  real but incomplete; the header reads `Partial data` and the warnings name
+  the servers that failed.
 - **Permission or unexpectedly empty results:** Enable role API access and
   allow `problem.get` plus `trigger.get`. Then check the token owner's user
   groups and read access to the relevant host groups. Zabbix silently scopes
   results to visible objects.
-- **TLS:** For an unknown private issuer, configure `caCertificateFile`; for a
-  hostname mismatch, fix the URL or certificate. Use `insecureTls` only as a
-  temporary diagnostic because it exposes the token to interception.
+- **TLS:** For an unknown private issuer, set that server's *Custom CA
+  certificate*; for a hostname mismatch, fix its URL or certificate. Use
+  *Disable TLS verification* only as a temporary diagnostic because it exposes
+  that server's token to interception.
 - **Network, DNS, timeout, or HTTP:** Check name resolution, routing, firewall,
   reverse proxy, and the final API URL. Redirects are rejected; configure the
   final HTTPS URL directly.
@@ -401,14 +490,18 @@ omarchy-shell dechnik.zabbix status
   Proxies and login pages returning HTML cause a malformed-response error.
   Unknown JSON-RPC errors are shown in sanitized form.
 - **Empty list after filtering:** `status` echoes the active filter as
-  `ack=all|unacknowledged|acknowledged` plus `ack-by-me`. An `Unacknowledged`
-  state on a well-tended Zabbix legitimately returns nothing.
+  `ack=all|unacknowledged|acknowledged` plus `ack-by-me`, and `selected=N` of
+  `servers=N` for the server filter. An `Unacknowledged` state on a well-tended
+  Zabbix legitimately returns nothing, and so does a server filter narrowed to
+  a quiet server.
 - **`identity-unavailable`:** `user.checkAuthentication` failed, so *only
   acknowledged by me* is not applied and the list shows every acknowledged
   problem. Permit the method for the token owner's role, then press `r` to
   retry; the failure is cached until then.
 - **Stale or truncated:** Stale means the displayed complete result predates a
-  failed refresh. Truncated means `problemLimit` was exceeded. Refresh after
+  failed refresh, or that some selected server has not answered at all.
+  Truncated means `problemLimit` was exceeded on at least one server; the limit
+  applies per server, not to the merged list. Refresh after
   fixing the error or raise the limit with awareness of larger API responses.
 - **Widget or hot-reload issue:** Confirm `dechnik.zabbix` is enabled. Saved
   plugin files normally hot-reload; during development, a full
@@ -423,15 +516,17 @@ omarchy plugin remove dechnik.zabbix
 ```
 
 Removal unloads the plugin and its widget settings but intentionally does not
-delete the token, a custom CA file, or the server-side Zabbix token. Revoke the
-API token in Zabbix, then remove local credentials if they are no longer used:
+delete any token file, custom CA file, or the server-side Zabbix tokens. Revoke
+each server's API token in Zabbix, then remove local credentials if they are no
+longer used:
 
 ```bash
 rm ~/.config/omarchy/zabbix/token
 rmdir ~/.config/omarchy/zabbix
 ```
 
-Adjust those paths if `tokenFile` or `caCertificateFile` was customized.
+Adjust and repeat those paths for every server whose token file or CA
+certificate was customized.
 
 ## Development
 
@@ -443,10 +538,22 @@ omarchy plugin validate .
 ```
 
 The Node suite exercises the pure request, parsing, security, filtering,
-summary, transaction, and backoff model. Validation checks the plugin manifest
-and entry point. Neither command contacts a live Zabbix server or constitutes
-live production, trusted-TLS, custom-CA, insecure-TLS, or multi-monitor
-verification; no such test is claimed here.
+summary, server-list, merge, aggregation, transaction, and backoff model, plus
+a few structural assertions over the QML sources. Validation checks the plugin
+manifest and entry point. Neither command contacts a live Zabbix server or
+constitutes live production, trusted-TLS, custom-CA, insecure-TLS, multi-server
+or multi-monitor verification; no such test is claimed here.
+
+The QML is checked with the same import root Quickshell gives it:
+
+```bash
+mkdir -p /tmp/qmlroot && ln -sfn /usr/share/omarchy/shell /tmp/qmlroot/qs
+qmllint -I /tmp/qmlroot Panel.qml Servers.qml Service.qml
+```
+
+`missing-property` and `unqualified` warnings against the shell's `Style`,
+`Color`, and `bar` singletons are expected: qmllint cannot resolve them
+outside a running shell.
 
 ## License
 

@@ -536,6 +536,35 @@ assert.ok(panelSource.indexOf('text: "Severity"') >= 0)
 assert.ok(panelSource.indexOf('text: "Acknowledgement"') >= 0)
 assert.ok(panelSource.indexOf("component FilterGroupLabel") >= 0)
 assert.ok(/onOpenedChanged: if \(opened\) \{[^}]*expanded = !zabbix\.configured;/.test(panelSource))
+// Servers, their filter, and the refresh interval are panel-owned now.
+assert.ok(panelSource.indexOf('text: "SERVERS · " + root.servers.length') >= 0)
+assert.ok(panelSource.indexOf('text: "Server"') >= 0)
+assert.ok(panelSource.indexOf("component ServerRow") >= 0)
+assert.ok(panelSource.indexOf("component ServerChip") >= 0)
+assert.ok(panelSource.indexOf("component EditorField") >= 0)
+assert.ok(panelSource.indexOf("id: refreshIntervalField") >= 0)
+// Writing the server list drops the pre-servers keys in the same write.
+assert.ok(panelSource.indexOf('root.writeSettings(patch, legacyConnectionKeys)') >= 0)
+assert.ok(/legacyConnectionKeys: \["url", "endpoint", "tokenFile", "caCertificateFile", "insecureTls"\]/.test(panelSource))
+// A focused field owns the keyboard; the panel's key catcher stands down.
+assert.ok(panelSource.indexOf("blocked: root.editingField") >= 0)
+// The panel aggregates servers rather than binding one Service.
+assert.ok(/Servers \{\s*id: zabbix/.test(panelSource))
+assert.strictEqual(panelSource.indexOf("Additional settings will appear here in a future update."), -1)
+
+var serversSource = fs.readFileSync(path.join(__dirname, "..", "Servers.qml"), "utf8")
+// The Instantiator is keyed on ids, not on the server objects: editing a URL
+// must reconfigure one Service, not tear every Service down.
+assert.ok(serversSource.indexOf("model: root.serverIdList") >= 0)
+assert.ok(serversSource.indexOf("server: root.serverFor(modelData)") >= 0)
+assert.ok(serversSource.indexOf("onChanged: root.schedule()") >= 0)
+assert.ok(serversSource.indexOf('JSON.stringify(next) !== JSON.stringify(servers)') >= 0)
+assert.ok(serviceSource.indexOf("onServerChanged: scheduleConfigurationReload()") >= 0)
+assert.ok(serviceSource.indexOf("Model.normalizeSettings(settings, home, server)") >= 0)
+assert.ok(serviceSource.indexOf("Model.configurationSignature(settings, token, home, server)") >= 0)
+// The token never leaves the Service, snapshot included.
+assert.strictEqual(serversSource.indexOf("token"), -1)
+
 // Progress state lives on the hero meta line, not in a banner.
 assert.strictEqual(panelSource.indexOf("Refreshing problems; the last complete result remains visible."), -1)
 assert.strictEqual(panelSource.indexOf("Waiting for the first problem refresh."), -1)
@@ -555,6 +584,14 @@ assert.ok(schemaKeys.indexOf("showUnmonitored") >= 0)
 assert.strictEqual(manifest.barWidget.defaults.showUnmonitored, false)
 assert.ok(schemaKeys.indexOf("acknowledgement") >= 0)
 assert.ok(schemaKeys.indexOf("acknowledgedByMe") >= 0)
+// Connection settings have no scalar form: they are per server and edited in
+// the panel. They stay readable from a legacy entry but are off the form.
+assert.strictEqual(schemaKeys.indexOf("url"), -1)
+assert.strictEqual(schemaKeys.indexOf("tokenFile"), -1)
+assert.strictEqual(schemaKeys.indexOf("caCertificateFile"), -1)
+assert.strictEqual(schemaKeys.indexOf("insecureTls"), -1)
+assert.deepStrictEqual(manifest.barWidget.defaults.servers, [])
+assert.deepStrictEqual(manifest.barWidget.defaults.selectedServers, [])
 manifest.barWidget.schema.forEach(function(field) {
   if (field.key !== "acknowledgement") return
   // The shell renders enum options as plain strings, so every option must
@@ -565,5 +602,195 @@ manifest.barWidget.schema.forEach(function(field) {
   })
   assert.strictEqual(Model.persistAcknowledgement(field.defaultValue), field.defaultValue)
 })
+
+// ---------------------------------------------------------------- servers
+
+var twoServers = {
+  servers: [
+    { id: "s1", name: "prod", url: "https://prod.test/zabbix", tokenFile: "~/prod.token" },
+    { id: "s2", url: "https://lab.test/zabbix/", tokenFile: "~/lab.token", insecureTls: "yes" }
+  ]
+}
+var parsedServers = Model.normalizeServers(twoServers, "/home/u")
+assert.strictEqual(parsedServers.length, 2)
+assert.strictEqual(parsedServers[0].id, "s1")
+assert.strictEqual(parsedServers[0].label, "prod")
+assert.strictEqual(parsedServers[0].endpoint, "https://prod.test/zabbix/api_jsonrpc.php")
+assert.strictEqual(parsedServers[0].tokenFile, "~/prod.token")
+assert.strictEqual(parsedServers[0].tokenFilePath, "/home/u/prod.token")
+assert.strictEqual(parsedServers[0].configured, true)
+// An unnamed server falls back to its host, never to an empty chip.
+assert.strictEqual(parsedServers[1].label, "lab.test")
+assert.strictEqual(parsedServers[1].insecureTls, true)
+
+// Malformed entries are skipped, and a duplicate id is renumbered so the
+// filter and the editor cannot address the wrong row.
+var messy = Model.normalizeServers({ servers: [null, "nope", { id: "s1", url: "https://a.test" }, { id: "s1", url: "https://b.test" }] }, "/home/u")
+assert.strictEqual(messy.length, 2)
+assert.strictEqual(messy[0].id, "s1")
+assert.notStrictEqual(messy[1].id, "s1")
+
+// A server with no HTTPS URL reports why and is not considered configured.
+var broken = Model.normalizeServers({ servers: [{ id: "s1", url: "http://plain.test" }] }, "/home/u")[0]
+assert.strictEqual(broken.endpoint, "")
+assert.strictEqual(broken.endpointError, "Zabbix URL must use HTTPS")
+assert.strictEqual(broken.configured, false)
+
+// Legacy single-server configuration, still written by `omarchy bar set`.
+var legacy = Model.normalizeServers({ url: "https://old.test/zabbix", caCertificateFile: "~/ca.pem", insecureTls: true }, "/home/u")
+assert.strictEqual(legacy.length, 1)
+assert.strictEqual(legacy[0].id, "s1")
+assert.strictEqual(legacy[0].endpoint, "https://old.test/zabbix/api_jsonrpc.php")
+assert.strictEqual(legacy[0].tokenFile, Model.DEFAULT_TOKEN_FILE)
+assert.strictEqual(legacy[0].caCertificateFile, "~/ca.pem")
+assert.strictEqual(legacy[0].insecureTls, true)
+// An empty servers array must not resurrect the legacy keys' absence as a server.
+assert.deepStrictEqual(Model.normalizeServers({ servers: [] }, "/home/u"), [])
+assert.deepStrictEqual(Model.normalizeServers({}, "/home/u"), [])
+// A servers array wins over leftover legacy keys.
+assert.strictEqual(Model.normalizeServers({ url: "https://old.test", servers: [{ id: "s4", url: "https://new.test" }] }, "/home/u")[0].id, "s4")
+
+assert.strictEqual(Model.newServerId([]), "s1")
+assert.strictEqual(Model.newServerId([{ id: "s1" }, { id: "s2" }]), "s3")
+// Gaps are reused so ids stay short and stable after a removal.
+assert.strictEqual(Model.newServerId([{ id: "s1" }, { id: "s3" }]), "s2")
+
+// Only the stored keys survive persistence; derived ones are recomputed.
+var persisted = Model.persistServers(parsedServers)
+assert.deepStrictEqual(Object.keys(persisted[0]).sort(), ["caCertificateFile", "id", "insecureTls", "name", "tokenFile", "url"])
+assert.strictEqual(persisted[0].url, "https://prod.test/zabbix")
+assert.strictEqual(persisted[1].insecureTls, true)
+// A persist/normalize round trip is stable.
+assert.deepStrictEqual(Model.persistServers(Model.normalizeServers({ servers: persisted }, "/home/u")), persisted)
+
+// Selection defaults to every server and drops ids of deleted ones.
+assert.deepStrictEqual(Model.parseServerSelection([], parsedServers), ["s1", "s2"])
+assert.deepStrictEqual(Model.parseServerSelection(["s2"], parsedServers), ["s2"])
+assert.deepStrictEqual(Model.parseServerSelection(["s2", "gone"], parsedServers), ["s2"])
+assert.deepStrictEqual(Model.parseServerSelection(["gone"], parsedServers), ["s1", "s2"])
+assert.deepStrictEqual(Model.parseServerSelection("s2,s1", parsedServers), ["s1", "s2"])
+// Clicking chips must not reshuffle the persisted order.
+assert.deepStrictEqual(Model.toggleServerSelection(["s2"], "s1", parsedServers), ["s1", "s2"])
+assert.deepStrictEqual(Model.toggleServerSelection(["s1", "s2"], "s1", parsedServers), ["s2"])
+// The last selected server stays selected, like the last severity chip.
+assert.deepStrictEqual(Model.toggleServerSelection(["s2"], "s2", parsedServers), ["s2"])
+assert.deepStrictEqual(Model.toggleServerSelection(["s1"], "gone", parsedServers), ["s1"])
+
+// The connection quartet comes from the server when one is given.
+var perServer = Model.normalizeSettings({ url: "https://ignored.test", tokenFile: "~/ignored" }, "/home/u", persisted[0])
+assert.strictEqual(perServer.endpoint, "https://prod.test/zabbix/api_jsonrpc.php")
+assert.strictEqual(perServer.tokenFile, "/home/u/prod.token")
+// Filters stay global.
+assert.strictEqual(Model.normalizeSettings({ severities: "5" }, "/home/u", persisted[0]).severitySetting, "5")
+
+// Each server hashes to its own Shared.js group; two identical ones share it.
+var sigA = Model.configurationSignature({}, "token", "/home/u", persisted[0])
+var sigB = Model.configurationSignature({}, "token", "/home/u", persisted[1])
+assert.notStrictEqual(sigA, sigB)
+assert.strictEqual(sigA, Model.configurationSignature({}, "token", "/home/u", { url: "https://prod.test/zabbix", tokenFile: "~/prod.token" }))
+assert.notStrictEqual(Model.dataSourceSignature({}, "token", "/home/u", persisted[0]), Model.dataSourceSignature({}, "token", "/home/u", persisted[1]))
+
+// ------------------------------------------------------- merge and aggregate
+
+function serverState(id, label, extra) {
+  var state = {
+    id: id, label: label, configured: true, hasData: true, loading: false, stale: false,
+    truncated: false, lastError: "", errorCategory: "", connectionState: "connected",
+    serverVersion: "7.0.0", lastUpdatedMs: 1000, insecureTls: false, identityError: "",
+    problems: []
+  }
+  for (var key in extra) state[key] = extra[key]
+  return state
+}
+
+function problemRow(eventId, severity) {
+  return { eventId: eventId, triggerId: "t" + eventId, name: "p" + eventId, clock: 10, severity: severity, acknowledged: false }
+}
+
+var states = [
+  serverState("s1", "prod", { problems: [problemRow("1", 5)] }),
+  serverState("s2", "lab", { problems: [problemRow("2", 3)] })
+]
+var merged = Model.mergeServerProblems(states, ["s1", "s2"])
+assert.strictEqual(merged.length, 2)
+assert.strictEqual(merged[0].serverId, "s1")
+assert.strictEqual(merged[0].serverName, "prod")
+assert.strictEqual(merged[1].serverName, "lab")
+// The merged list still filters and sorts like a single server's did.
+assert.strictEqual(Model.sortProblems(merged)[0].eventId, "1")
+assert.strictEqual(Model.filterProblems(merged, [5], "All").length, 1)
+assert.deepStrictEqual(Model.mergeServerProblems(states, ["s2"]).map(function (p) { return p.serverId }), ["s2"])
+// No selection means every server, never an empty list.
+assert.strictEqual(Model.mergeServerProblems(states, []).length, 2)
+
+var healthy = Model.aggregateServerStates(states, ["s1", "s2"])
+assert.strictEqual(healthy.serverCount, 2)
+assert.strictEqual(healthy.connectedCount, 2)
+assert.strictEqual(healthy.failingCount, 0)
+assert.strictEqual(healthy.hasData, true)
+assert.strictEqual(healthy.partial, false)
+assert.strictEqual(healthy.stale, false)
+assert.strictEqual(healthy.connectionState, "connected")
+// A merged list has no single version to name.
+assert.strictEqual(healthy.serverVersion, "")
+assert.strictEqual(Model.aggregateServerStates(states, ["s1"]).serverVersion, "7.0.0")
+
+// One server down still reports the other's problems, marked stale.
+var degraded = Model.aggregateServerStates([
+  states[0],
+  serverState("s2", "lab", { hasData: false, lastError: "boom", errorCategory: "network" })
+], ["s1", "s2"])
+assert.strictEqual(degraded.hasData, true)
+assert.strictEqual(degraded.partial, true)
+assert.strictEqual(degraded.stale, true)
+assert.strictEqual(degraded.connectedCount, 1)
+assert.strictEqual(degraded.failingCount, 1)
+assert.strictEqual(degraded.lastError, "boom")
+assert.strictEqual(degraded.errorCategory, "network")
+assert.strictEqual(degraded.connectionState, "connected")
+
+// A server nobody finished setting up is not counted as failing.
+var halfSetUp = Model.aggregateServerStates([
+  states[0],
+  serverState("s2", "lab", { configured: false, hasData: false, lastError: "Zabbix URL is not configured", errorCategory: "endpoint" })
+], ["s1", "s2"])
+assert.strictEqual(halfSetUp.failingCount, 0)
+assert.strictEqual(halfSetUp.lastError, "")
+assert.strictEqual(halfSetUp.configuredCount, 1)
+// It is also not a missing contributor, so the result is not partial.
+assert.strictEqual(halfSetUp.partial, false)
+assert.strictEqual(halfSetUp.hasData, true)
+
+var dark = Model.aggregateServerStates([
+  serverState("s1", "prod", { hasData: false, lastError: "boom", errorCategory: "network" })
+], ["s1"])
+assert.strictEqual(dark.hasData, false)
+assert.strictEqual(dark.partial, false)
+assert.strictEqual(dark.connectionState, "error")
+
+// The oldest contributor is the honest age of the merged list.
+assert.strictEqual(Model.aggregateServerStates([
+  serverState("s1", "prod", { lastUpdatedMs: 5000 }),
+  serverState("s2", "lab", { lastUpdatedMs: 2000 })
+], ["s1", "s2"]).lastUpdatedMs, 2000)
+
+// Progress from the server still working wins the header meta phase.
+assert.strictEqual(Model.aggregateServerStates([
+  serverState("s1", "prod", { hasData: false, loading: true, connectionState: "fetch_problems" })
+], ["s1"]).connectionState, "fetch_problems")
+
+assert.strictEqual(Model.aggregateServerStates([], []).configured, false)
+assert.strictEqual(Model.aggregateServerStates([], []).connectionState, "unconfigured")
+assert.strictEqual(Model.aggregateServerStates([serverState("s1", "prod", { insecureTls: true })], ["s1"]).insecureTls, true)
+
+// The configuration this plugin shipped with reads as exactly one server.
+var installed = { id: "dechnik.zabbix", acknowledgement: "Unacknowledged", insecureTls: "true", severities: ["3", "4", "5"], showUnmonitored: "false", url: "https://monitor.example.internal/" }
+var installedServers = Model.normalizeServers(installed, "/home/u")
+assert.strictEqual(installedServers.length, 1)
+assert.strictEqual(installedServers[0].endpoint, "https://monitor.example.internal/api_jsonrpc.php")
+assert.strictEqual(installedServers[0].insecureTls, true)
+assert.strictEqual(installedServers[0].configured, true)
+assert.deepStrictEqual(Model.parseServerSelection(installed.selectedServers, installedServers), ["s1"])
+assert.strictEqual(Model.normalizeSettings(installed, "/home/u", installedServers[0]).acknowledgement, "unacknowledged")
 
 console.log("model: all assertions passed")

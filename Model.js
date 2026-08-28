@@ -198,9 +198,14 @@ function persistAcknowledgement(value) {
   return acknowledgementDefinition(value).label
 }
 
-function normalizeSettings(settings, home) {
+// `server` supplies the connection quartet when the widget polls a list of
+// servers. Without it the same four keys are read from the top level, which is
+// how a pre-servers configuration — and `omarchy bar set` — still works.
+function normalizeSettings(settings, home, server) {
   var source = settings || {}
-  var endpoint = normalizeEndpoint(source.url === undefined ? source.endpoint : source.url)
+  var connection = server || source
+  var rawUrl = connection.url === undefined ? connection.endpoint : connection.url
+  var endpoint = normalizeEndpoint(rawUrl)
   var severities = parseSeveritySelection(source.severities)
   var acknowledgement = parseAcknowledgement(source.acknowledgement)
   var acknowledgedByMe = boolValue(source.acknowledgedByMe, false)
@@ -215,10 +220,10 @@ function normalizeSettings(settings, home) {
   return {
     url: endpoint,
     endpoint: endpoint,
-    endpointError: endpointError(source.url === undefined ? source.endpoint : source.url),
-    tokenFile: expandHome(source.tokenFile === undefined ? DEFAULT_TOKEN_FILE : source.tokenFile, home),
-    caCertificateFile: expandHome(source.caCertificateFile, home),
-    insecureTls: boolValue(source.insecureTls, false),
+    endpointError: endpointError(rawUrl),
+    tokenFile: expandHome(connection.tokenFile === undefined ? DEFAULT_TOKEN_FILE : connection.tokenFile, home),
+    caCertificateFile: expandHome(connection.caCertificateFile, home),
+    insecureTls: boolValue(connection.insecureTls, false),
     refreshIntervalSec: clampInteger(source.refreshIntervalSec, DEFAULT_REFRESH_INTERVAL_SEC, MIN_REFRESH_INTERVAL_SEC, MAX_REFRESH_INTERVAL_SEC),
     problemLimit: clampInteger(source.problemLimit, DEFAULT_PROBLEM_LIMIT, MIN_PROBLEM_LIMIT, MAX_PROBLEM_LIMIT),
     severities: severities,
@@ -232,6 +237,307 @@ function normalizeSettings(settings, home) {
     showSuppressed: showSuppressed,
     showSymptoms: showSymptoms,
     showUnmonitored: showUnmonitored
+  }
+}
+
+// Settings crossing a QML `property var` arrive as QVariantList/QVariantMap
+// wrappers that index like arrays but fail `instanceof Array`, so every list
+// read below goes through this rather than a type check.
+function arrayLike(value) {
+  if (value instanceof Array) return value
+  if (value && typeof value === "object" && typeof value.length === "number") return value
+  return null
+}
+
+function endpointHost(value) {
+  var match = trim(value).match(/^https:\/\/([^\s\/?#:]+)/i)
+  return match ? match[1] : ""
+}
+
+function nextServerId(used) {
+  for (var n = 1; ; n++) {
+    var candidate = "s" + n
+    if (!used[candidate]) return candidate
+  }
+}
+
+function newServerId(servers) {
+  var list = arrayLike(servers) || []
+  var used = {}
+  for (var i = 0; i < list.length; i++) {
+    var id = trim(list[i] && list[i].id)
+    if (id !== "") used[id] = true
+  }
+  return nextServerId(used)
+}
+
+// `url` and `tokenFile` stay in the form the user typed because they are
+// written straight back to shell.json; `endpoint` and `tokenFilePath` are the
+// derived forms a request needs.
+function normalizeServer(raw, home, index) {
+  var source = raw && typeof raw === "object" ? raw : {}
+  var position = Number(index)
+  if (!isFinite(position) || position < 0) position = 0
+  var rawUrl = source.url === undefined ? source.endpoint : source.url
+  var url = trim(rawUrl)
+  var name = trim(source.name)
+  var tokenFile = trim(source.tokenFile === undefined ? DEFAULT_TOKEN_FILE : source.tokenFile)
+  var endpoint = normalizeEndpoint(url)
+  return {
+    id: trim(source.id) || ("s" + (position + 1)),
+    name: name,
+    label: name || endpointHost(url) || ("Server " + (position + 1)),
+    url: url,
+    endpoint: endpoint,
+    endpointError: endpointError(url),
+    tokenFile: tokenFile,
+    tokenFilePath: expandHome(tokenFile, home),
+    caCertificateFile: trim(source.caCertificateFile),
+    insecureTls: boolValue(source.insecureTls, false),
+    configured: endpoint !== "" && tokenFile !== ""
+  }
+}
+
+// A configuration written before the servers list existed still names one
+// server through the top-level keys, and `omarchy bar set ... url` still
+// writes there. Either way it is read as a single entry until the panel
+// writes a servers array, which drops those keys.
+function normalizeServers(settings, home) {
+  var source = settings || {}
+  var list = arrayLike(source.servers) || []
+  var output = []
+  var seen = {}
+  for (var i = 0; i < list.length; i++) {
+    var entry = list[i]
+    if (!entry || typeof entry !== "object") continue
+    var server = normalizeServer(entry, home, output.length)
+    // Duplicate ids would make the filter and the editor address the wrong row.
+    if (seen[server.id]) server.id = nextServerId(seen)
+    seen[server.id] = true
+    output.push(server)
+  }
+  if (output.length > 0) return output
+
+  var legacyUrl = source.url === undefined ? source.endpoint : source.url
+  if (trim(legacyUrl) === "" && trim(source.tokenFile) === "") return output
+  output.push(normalizeServer({
+    url: legacyUrl,
+    tokenFile: source.tokenFile,
+    caCertificateFile: source.caCertificateFile,
+    insecureTls: source.insecureTls
+  }, home, 0))
+  return output
+}
+
+// Only the keys that belong in shell.json; the derived ones are recomputed on
+// every read and would otherwise rot in the file.
+function persistServers(servers) {
+  var list = arrayLike(servers) || []
+  var output = []
+  for (var i = 0; i < list.length; i++) {
+    var server = list[i]
+    if (!server) continue
+    output.push({
+      id: trim(server.id) || ("s" + (i + 1)),
+      name: trim(server.name),
+      url: trim(server.url),
+      tokenFile: trim(server.tokenFile),
+      caCertificateFile: trim(server.caCertificateFile),
+      insecureTls: server.insecureTls === true
+    })
+  }
+  return output
+}
+
+function serverIds(servers) {
+  var list = arrayLike(servers) || []
+  var output = []
+  for (var i = 0; i < list.length; i++) {
+    var id = trim(list[i] && list[i].id)
+    if (id !== "") output.push(id)
+  }
+  return output
+}
+
+// An empty or fully unknown selection means every server: a filter that
+// silently hid everything would look like an outage.
+function parseServerSelection(raw, servers) {
+  var all = serverIds(servers)
+  var known = {}
+  for (var k = 0; k < all.length; k++) known[all[k]] = true
+  var parts = arrayLike(raw)
+  if (!parts) parts = text(raw) === "" ? [] : text(raw).split(",")
+  var output = []
+  var seen = {}
+  for (var i = 0; i < parts.length; i++) {
+    var value = trim(parts[i])
+    if (value === "" || seen[value] || !known[value]) continue
+    seen[value] = true
+    output.push(value)
+  }
+  if (output.length === 0) return all
+  // Persist in server order so clicking chips never reshuffles shell.json.
+  var ordered = []
+  for (var a = 0; a < all.length; a++) if (seen[all[a]]) ordered.push(all[a])
+  return ordered
+}
+
+function toggleServerSelection(selection, id, servers) {
+  var current = parseServerSelection(selection, servers)
+  var target = trim(id)
+  var index = current.indexOf(target)
+  if (index < 0) {
+    if (serverIds(servers).indexOf(target) < 0) return current
+    var added = current.slice()
+    added.push(target)
+    return parseServerSelection(added, servers)
+  }
+  // The last selected server stays selected, mirroring the severity chips.
+  if (current.length <= 1) return current
+  var next = current.slice()
+  next.splice(index, 1)
+  return next
+}
+
+function selectionMap(selectedIds) {
+  var list = arrayLike(selectedIds)
+  if (!list) return null
+  var map = {}
+  var found = false
+  for (var i = 0; i < list.length; i++) {
+    var id = trim(list[i])
+    if (id === "") continue
+    map[id] = true
+    found = true
+  }
+  return found ? map : null
+}
+
+function isSelectedServer(allowed, id) {
+  return !allowed || allowed[id] === true
+}
+
+// Fields are copied one by one rather than with a for-in: these problems have
+// already crossed a QML property boundary, where enumeration is not reliable.
+function tagProblem(problem, serverId, serverName) {
+  var source = problem || {}
+  return {
+    eventId: idString(source.eventId),
+    triggerId: idString(source.triggerId),
+    name: trim(source.name) || "Unnamed problem",
+    clock: Number(source.clock) || 0,
+    timestampMs: Number(source.timestampMs) || 0,
+    severity: Number(source.severity),
+    acknowledged: source.acknowledged === true,
+    suppressed: source.suppressed === true,
+    causeEventId: idString(source.causeEventId),
+    isSymptom: source.isSymptom === true,
+    tags: source.tags,
+    hosts: source.hosts,
+    hostNames: source.hostNames,
+    hostsAvailable: source.hostsAvailable === true,
+    hostLabel: trim(source.hostLabel),
+    serverId: trim(serverId),
+    serverName: trim(serverName)
+  }
+}
+
+// Stamping the server here, rather than into the published payload, keeps
+// Shared.js payloads server-agnostic — two identically configured servers
+// still share a single fetch.
+function mergeServerProblems(states, selectedIds) {
+  var list = arrayLike(states) || []
+  var allowed = selectionMap(selectedIds)
+  var output = []
+  for (var i = 0; i < list.length; i++) {
+    var state = list[i]
+    if (!state) continue
+    var id = trim(state.id)
+    if (!isSelectedServer(allowed, id)) continue
+    var problems = arrayLike(state.problems) || []
+    for (var p = 0; p < problems.length; p++) output.push(tagProblem(problems[p], id, trim(state.label)))
+  }
+  return output
+}
+
+// One server going dark degrades the merged result to stale rather than
+// blanking the bar: the servers that did answer still carry actionable counts.
+function aggregateServerStates(states, selectedIds) {
+  var list = arrayLike(states) || []
+  var allowed = selectionMap(selectedIds)
+  var serverCount = 0
+  var configuredCount = 0
+  var dataCount = 0
+  var connectedCount = 0
+  var failingCount = 0
+  var loading = false
+  var anyStale = false
+  var truncated = false
+  var insecureTls = false
+  var lastUpdatedMs = 0
+  var lastError = ""
+  var errorCategory = ""
+  var identityError = ""
+  var serverVersion = ""
+  var phase = ""
+  for (var i = 0; i < list.length; i++) {
+    var state = list[i]
+    if (!state || !isSelectedServer(allowed, trim(state.id))) continue
+    serverCount += 1
+    // The header meta line reports progress, so the first server still working
+    // is the one worth naming a phase for.
+    if (phase === "" && state.loading === true) phase = trim(state.connectionState)
+    if (state.configured === true) configuredCount += 1
+    if (state.loading === true) loading = true
+    if (state.stale === true) anyStale = true
+    if (state.truncated === true) truncated = true
+    if (state.insecureTls === true) insecureTls = true
+    if (state.hasData === true) {
+      dataCount += 1
+      var stamp = Number(state.lastUpdatedMs) || 0
+      // The oldest contributor is the honest age of the merged list.
+      if (stamp > 0 && (lastUpdatedMs === 0 || stamp < lastUpdatedMs)) lastUpdatedMs = stamp
+      if (state.stale !== true && trim(state.lastError) === "") connectedCount += 1
+    }
+    // A server nobody finished setting up is not "failing" — its own notice
+    // already says it needs a URL, and counting it would inflate the tally.
+    if (state.configured === true && trim(state.lastError) !== "") {
+      failingCount += 1
+      if (lastError === "") {
+        lastError = trim(state.lastError)
+        errorCategory = trim(state.errorCategory)
+      }
+    }
+    if (identityError === "" && trim(state.identityError) !== "") identityError = trim(state.identityError)
+    serverVersion = trim(state.serverVersion)
+  }
+  // A merged list has no single version; only one server can claim one.
+  if (serverCount !== 1) serverVersion = ""
+  var partial = dataCount > 0 && dataCount < configuredCount
+  if (phase === "") {
+    if (configuredCount === 0) phase = "unconfigured"
+    else if (dataCount > 0) phase = insecureTls ? "insecure" : "connected"
+    else if (failingCount > 0) phase = "error"
+    else phase = "connecting"
+  }
+  return {
+    connectionState: phase,
+    serverCount: serverCount,
+    configuredCount: configuredCount,
+    connectedCount: connectedCount,
+    failingCount: failingCount,
+    configured: configuredCount > 0,
+    hasData: dataCount > 0,
+    partial: partial,
+    loading: loading,
+    stale: anyStale || partial,
+    truncated: truncated,
+    insecureTls: insecureTls,
+    lastUpdatedMs: lastUpdatedMs,
+    serverVersion: serverVersion,
+    lastError: lastError,
+    errorCategory: errorCategory,
+    identityError: identityError
   }
 }
 
@@ -338,8 +644,8 @@ function sha256(value) {
   return output
 }
 
-function configurationSignature(settings, token, home) {
-  var normalized = normalizeSettings(settings, home)
+function configurationSignature(settings, token, home, server) {
+  var normalized = normalizeSettings(settings, home, server)
   var material = [
     normalized.endpoint,
     normalized.tokenFile,
@@ -358,8 +664,8 @@ function configurationSignature(settings, token, home) {
   return sha256(material)
 }
 
-function dataSourceSignature(settings, token, home) {
-  var normalized = normalizeSettings(settings, home)
+function dataSourceSignature(settings, token, home, server) {
+  var normalized = normalizeSettings(settings, home, server)
   return sha256(normalized.endpoint + "\u0000" + sha256(text(token)))
 }
 
@@ -1036,6 +1342,18 @@ if (typeof module !== "undefined") {
     beginTransaction: beginTransaction,
     stageProblems: stageProblems,
     stageHosts: stageHosts,
+    arrayLike: arrayLike,
+    endpointHost: endpointHost,
+    newServerId: newServerId,
+    normalizeServer: normalizeServer,
+    normalizeServers: normalizeServers,
+    persistServers: persistServers,
+    serverIds: serverIds,
+    parseServerSelection: parseServerSelection,
+    toggleServerSelection: toggleServerSelection,
+    tagProblem: tagProblem,
+    mergeServerProblems: mergeServerProblems,
+    aggregateServerStates: aggregateServerStates,
     canCommitTransaction: canCommitTransaction,
     commitTransaction: commitTransaction,
     failTransaction: failTransaction

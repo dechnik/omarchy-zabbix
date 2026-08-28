@@ -10,8 +10,13 @@ Item {
     id: root
 
     property var settings: ({})
+    // The connection quartet this instance polls. Null falls back to the
+    // top-level settings keys, which is how a pre-servers configuration works.
+    property var server: null
     readonly property string home: Quickshell.env("HOME") || ""
-    readonly property var normalized: Model.normalizeSettings(settings, home)
+    readonly property var normalized: Model.normalizeSettings(settings, home, server)
+    readonly property string serverId: server ? String(server.id || "") : ""
+    readonly property string serverLabel: server ? String(server.label || server.name || "") : ""
     readonly property string tokenFilePath: normalized.tokenFile
     readonly property bool insecureTls: normalized.insecureTls
     readonly property var selectedSeverities: normalized.severities
@@ -25,8 +30,8 @@ Item {
     readonly property bool showUnmonitored: normalized.showUnmonitored
     readonly property bool configured: normalized.endpoint !== "" && tokenFilePath !== ""
     readonly property bool hasData: lastUpdatedMs > 0
-    readonly property string signature: Model.configurationSignature(settings, token, home)
-    readonly property string authorizationSignature: Model.dataSourceSignature(settings, token, home)
+    readonly property string signature: Model.configurationSignature(settings, token, home, server)
+    readonly property string authorizationSignature: Model.dataSourceSignature(settings, token, home, server)
     readonly property int effectiveIntervalMs: Model.failureBackoffMs(normalized.refreshIntervalSec, failureStreak)
 
     property string token: ""
@@ -57,6 +62,44 @@ Item {
     property var sharedBasePayload: null
     property string requestOutput: ""
     property string requestError: ""
+
+    // QML bindings cannot track an Instantiator's children, so the pool that
+    // aggregates several servers recomputes on this instead.
+    signal changed
+
+    onProblemsChanged: changed()
+    onLoadingChanged: changed()
+    onStaleChanged: changed()
+    onTruncatedChanged: changed()
+    onLastErrorChanged: changed()
+    onErrorCategoryChanged: changed()
+    onConnectionStateChanged: changed()
+    onServerVersionChanged: changed()
+    onLastUpdatedMsChanged: changed()
+    onIdentityErrorChanged: changed()
+    onConfiguredChanged: changed()
+
+    function snapshot() {
+        return {
+            id: serverId,
+            label: serverLabel,
+            endpointError: normalized.endpointError,
+            configured: configured,
+            hasData: hasData,
+            loading: loading,
+            stale: stale,
+            truncated: truncated,
+            lastError: lastError,
+            errorCategory: errorCategory,
+            connectionState: connectionState,
+            serverVersion: serverVersion,
+            lastUpdatedMs: lastUpdatedMs,
+            insecureTls: insecureTls,
+            identityError: identityError,
+            acknowledgedByMe: acknowledgedByMe,
+            problems: problems
+        };
+    }
 
     function syncMembership() {
         var authorizationChanged = joinedAuthorizationSignature !== "" && joinedAuthorizationSignature !== authorizationSignature;
@@ -592,6 +635,7 @@ Item {
     }
 
     onSettingsChanged: scheduleConfigurationReload()
+    onServerChanged: scheduleConfigurationReload()
     onTokenChanged: scheduleConfigurationReload()
 
     Component.onCompleted: reloadTimer.restart()

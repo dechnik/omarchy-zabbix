@@ -21,6 +21,14 @@ Panel {
     // panel exists to show problems, so the chrome starts out of the way.
     property bool expanded: false
 
+    // Which server row has its editor open, as an accordion. Panel-local like
+    // `expanded`, and reset on every open.
+    property int editingServerIndex: -1
+    // A focused TextField or spin box must receive keys itself, so the panel's
+    // key catcher stands down while one owns the keyboard.
+    property int editorFocusCount: 0
+    readonly property bool editingField: editorFocusCount > 0
+
     readonly property color foreground: bar ? bar.foreground : Color.foreground
     readonly property color barTextColor: bar ? bar.barForeground : Color.foreground
     readonly property color urgent: bar ? bar.urgent : Color.urgent
@@ -28,6 +36,13 @@ Panel {
     readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
     readonly property bool vertical: bar ? bar.vertical : false
 
+    readonly property var servers: zabbix.servers
+    // Repeaters key on the stable id list, not on the server objects: editing
+    // a name must update one row's bindings, not rebuild every delegate and
+    // destroy the very field being typed into.
+    readonly property var serverIdList: zabbix.serverIdList
+    readonly property var selectedServerIds: zabbix.selectedServerIds
+    readonly property bool multiServer: zabbix.multiServer
     readonly property var selectedSeverities: Model.parseSeveritySelection(zabbix.selectedSeverities)
     readonly property string acknowledgement: zabbix.acknowledgement
     readonly property bool acknowledgedByMe: zabbix.acknowledgedByMeSetting
@@ -45,13 +60,22 @@ Panel {
     readonly property var notices: noticeList()
     readonly property bool hasNotices: notices.length > 0
 
-    readonly property int severityCursorBase: 0
+    // The cursor walks the expanded panel in the order it is drawn: the server
+    // editor, then the filters, then the refresh interval, then the problems.
+    // An open editor inserts its two own stops directly after its server row.
+    readonly property int serverEditorCursorBase: 0
+    readonly property int insecureTlsCursorIndex: editingServerIndex >= 0 ? serverEditorCursorBase + editingServerIndex + 1 : -1
+    readonly property int removeServerCursorIndex: editingServerIndex >= 0 ? insecureTlsCursorIndex + 1 : -1
+    readonly property int addServerCursorIndex: serverEditorCursorBase + servers.length + (editingServerIndex >= 0 ? 2 : 0)
+    readonly property int serverFilterCursorBase: addServerCursorIndex + 1
+    readonly property int severityCursorBase: serverFilterCursorBase + (multiServer ? servers.length : 0)
     readonly property int acknowledgementCursorBase: severityCursorBase + Model.SEVERITIES.length
     readonly property int acknowledgedByMeCursorIndex: acknowledgementCursorBase + Model.ACKNOWLEDGEMENTS.length
     readonly property int showSuppressedCursorIndex: acknowledgedByMeCursorIndex + 1
     readonly property int showSymptomsCursorIndex: showSuppressedCursorIndex + 1
     readonly property int showUnmonitoredCursorIndex: showSymptomsCursorIndex + 1
-    readonly property int problemCursorBase: expanded ? showUnmonitoredCursorIndex + 1 : 0
+    readonly property int refreshIntervalCursorIndex: showUnmonitoredCursorIndex + 1
+    readonly property int problemCursorBase: expanded ? refreshIntervalCursorIndex + 1 : 0
     readonly property int cursorCount: problemCursorBase + visibleProblems.length
     // Refreshing is routine background noise; only stale data earns a bar glyph.
     readonly property string activityGlyph: zabbix.stale ? "󰅖" : ""
@@ -92,36 +116,56 @@ Panel {
     // already on the hero meta line and the bar glyph, so it earns no banner.
     function noticeList() {
         var list = [];
-        if (!zabbix.configured)
+        if (servers.length === 0) {
             list.push({
-                message: "Configure the Zabbix HTTPS URL and API token file in this widget's settings.",
+                message: "No Zabbix server is configured. Add one in the SERVERS section below.",
                 urgent: false
             });
-        if (zabbix.lastError !== "")
-            list.push({
-                message: errorTitle() + ": " + zabbix.lastError,
-                urgent: true
-            });
-        if (zabbix.stale && zabbix.hasData)
-            list.push({
-                message: "Showing the last complete result because the latest refresh failed.",
-                urgent: true
-            });
-        if (zabbix.acknowledgedByMe && zabbix.identityError !== "")
-            list.push({
-                message: "Zabbix did not identify the API token's user, so the acknowledged-by-me filter is not applied. Permit user.checkAuthentication for the token's role. " + zabbix.identityError,
-                urgent: true
-            });
-        if (zabbix.truncated && zabbix.hasData)
-            list.push({
-                message: "The configured problem limit was reached. More matching problems may exist.",
-                urgent: true
-            });
-        if (zabbix.insecureTls)
-            list.push({
-                message: "TLS certificate verification is disabled. The API token and monitoring data may be intercepted.",
-                urgent: true
-            });
+            return list;
+        }
+
+        // Every message names its server once more than one is configured;
+        // an unprefixed warning would be unactionable in a merged list.
+        var states = zabbix.serverStates;
+        for (var i = 0; i < states.length; i++) {
+            var state = states[i];
+            if (selectedServerIds.indexOf(String(state.id)) < 0)
+                continue;
+            var prefix = multiServer ? String(state.label) + ": " : "";
+            if (state.configured !== true) {
+                var reason = String(state.endpointError || "") !== "" ? String(state.endpointError) : "API token file is not configured";
+                list.push({
+                    message: prefix + reason + ". Configure it in the SERVERS section below.",
+                    urgent: false
+                });
+                continue;
+            }
+            if (String(state.lastError || "") !== "")
+                list.push({
+                    message: prefix + errorTitle(state.errorCategory) + ": " + state.lastError,
+                    urgent: true
+                });
+            if (state.stale === true && state.hasData === true)
+                list.push({
+                    message: prefix + "Showing the last complete result because the latest refresh failed.",
+                    urgent: true
+                });
+            if (zabbix.acknowledgedByMe && String(state.identityError || "") !== "")
+                list.push({
+                    message: prefix + "Zabbix did not identify the API token's user, so the acknowledged-by-me filter is not applied. Permit user.checkAuthentication for the token's role. " + state.identityError,
+                    urgent: true
+                });
+            if (state.truncated === true && state.hasData === true)
+                list.push({
+                    message: prefix + "The configured problem limit was reached. More matching problems may exist.",
+                    urgent: true
+                });
+            if (state.insecureTls === true)
+                list.push({
+                    message: prefix + "TLS certificate verification is disabled. The API token and monitoring data may be intercepted.",
+                    urgent: true
+                });
+        }
         return list;
     }
 
@@ -129,18 +173,140 @@ Panel {
         return selectedSeverities.indexOf(Number(value)) !== -1;
     }
 
-    function writeSettings(patch) {
+    // `removeKeys` exists so writing the server list can also drop the
+    // pre-servers connection keys, leaving one source of truth behind.
+    function writeSettings(patch, removeKeys) {
+        var drop = {};
+        for (var d = 0; d < (removeKeys || []).length; d++)
+            drop[removeKeys[d]] = true;
         var entry = {
             id: moduleName
         };
         for (var key in settings)
-            if (key !== "id")
+            if (key !== "id" && !drop[key])
                 entry[key] = settings[key];
         for (var changed in patch)
             entry[changed] = patch[changed];
         settings = entry;
         if (bar && bar.shell && typeof bar.shell.updateEntryInline === "function")
             bar.shell.updateEntryInline(moduleName, entry);
+    }
+
+    readonly property var legacyConnectionKeys: ["url", "endpoint", "tokenFile", "caCertificateFile", "insecureTls"]
+
+    function serverEntries() {
+        return Model.persistServers(servers);
+    }
+
+    function writeServers(list, selection) {
+        var patch = {
+            servers: Model.persistServers(list)
+        };
+        if (selection !== undefined)
+            patch.selectedServers = selection;
+        root.writeSettings(patch, legacyConnectionKeys);
+    }
+
+    function updateServer(index, patch) {
+        var list = serverEntries();
+        if (index < 0 || index >= list.length)
+            return;
+        for (var key in patch)
+            list[index][key] = patch[key];
+        writeServers(list);
+    }
+
+    function addServer() {
+        var list = serverEntries();
+        var id = Model.newServerId(list);
+        list.push({
+            id: id,
+            name: "",
+            url: "",
+            tokenFile: Model.DEFAULT_TOKEN_FILE,
+            caCertificateFile: "",
+            insecureTls: false
+        });
+        var selection = selectedServerIds.slice();
+        selection.push(id);
+        writeServers(list, selection);
+        editingServerIndex = list.length - 1;
+    }
+
+    function removeServer(index) {
+        var list = serverEntries();
+        if (index < 0 || index >= list.length)
+            return;
+        var removedId = list[index].id;
+        list.splice(index, 1);
+        var selection = [];
+        for (var i = 0; i < selectedServerIds.length; i++)
+            if (selectedServerIds[i] !== removedId)
+                selection.push(selectedServerIds[i]);
+        editingServerIndex = -1;
+        writeServers(list, selection);
+    }
+
+    function toggleServerEditor(index) {
+        editingServerIndex = editingServerIndex === index ? -1 : index;
+    }
+
+    function toggleServer(id) {
+        root.writeSettings({
+            selectedServers: Model.toggleServerSelection(selectedServerIds, id, servers)
+        });
+    }
+
+    function serverSelected(id) {
+        return selectedServerIds.indexOf(String(id)) !== -1;
+    }
+
+    function setRefreshInterval(value) {
+        var next = Math.round(Number(value));
+        if (!isFinite(next))
+            return;
+        next = Math.max(Model.MIN_REFRESH_INTERVAL_SEC, Math.min(Model.MAX_REFRESH_INTERVAL_SEC, next));
+        if (next === zabbix.refreshIntervalSec)
+            return;
+        root.writeSettings({
+            refreshIntervalSec: next
+        });
+    }
+
+    // Cursor stops for the server rows renumber around the open editor's own
+    // two stops, so the walk order always matches what is on screen.
+    function serverRowForCursor(index) {
+        var offset = index - serverEditorCursorBase;
+        if (offset < 0 || index >= addServerCursorIndex)
+            return -1;
+        if (editingServerIndex < 0)
+            return offset;
+        if (offset <= editingServerIndex)
+            return offset;
+        if (offset <= editingServerIndex + 2)
+            return -1;
+        return offset - 2;
+    }
+
+    function cursorForServerRow(row) {
+        if (editingServerIndex >= 0 && row > editingServerIndex)
+            return serverEditorCursorBase + row + 2;
+        return serverEditorCursorBase + row;
+    }
+
+    function beginFieldEdit() {
+        editorFocusCount += 1;
+    }
+
+    function endFieldEdit() {
+        editorFocusCount = Math.max(0, editorFocusCount - 1);
+    }
+
+    function releaseFieldFocus() {
+        Qt.callLater(function () {
+            if (keyCatcher)
+                keyCatcher.forceActiveFocus();
+        });
     }
 
     function toggleSeverity(value) {
@@ -258,6 +424,10 @@ Panel {
         }
         if (!zabbix.hasData && zabbix.lastError !== "")
             return "Connection error";
+        // Partial is its own state: some servers answered and some did not, so
+        // the count is real but incomplete.
+        if (zabbix.partial)
+            return "Partial data";
         if (zabbix.stale)
             return "Stale data";
         if (zabbix.hasData)
@@ -267,14 +437,18 @@ Panel {
 
     function headerMeta() {
         var parts = [connectionLabel()];
-        if (String(zabbix.serverVersion || "") !== "")
+        // A merged list has no single Zabbix version to name, so the server
+        // tally takes that slot instead.
+        if (multiServer)
+            parts.push(zabbix.connectedCount + "/" + servers.length + " servers connected");
+        else if (String(zabbix.serverVersion || "") !== "")
             parts.push("Zabbix " + zabbix.serverVersion);
         if (zabbix.lastUpdatedMs > 0)
             parts.push(freshnessText());
         return parts.join(" · ");
     }
 
-    function errorTitle() {
+    function errorTitle(category) {
         var labels = {
             endpoint: "Endpoint error",
             network: "Network error",
@@ -291,7 +465,7 @@ Panel {
             malformed: "Invalid API response",
             "malformed-response": "Invalid API response"
         };
-        return labels[String(zabbix.errorCategory || "")] || "Request failed";
+        return labels[String(category !== undefined ? category : zabbix.errorCategory || "")] || "Request failed";
     }
 
     function barTooltip() {
@@ -311,6 +485,10 @@ Panel {
             parts.push("No matching Zabbix problems");
         else
             parts.push(summaryCount + " " + severityLabel(summarySeverity) + " problem" + (summaryCount === 1 ? "" : "s"));
+        if (multiServer)
+            parts.push("across " + selectedServerIds.length + " of " + servers.length + " servers");
+        if (zabbix.failingCount > 0)
+            parts.push(zabbix.failingCount + " server" + (zabbix.failingCount === 1 ? "" : "s") + " failing");
         if (zabbix.stale)
             parts.push("stale");
         if (zabbix.truncated)
@@ -361,16 +539,24 @@ Panel {
         return Math.floor(elapsed / 86400) + "d";
     }
 
+    // Deliberately free of URLs, host names, and server names: this string is
+    // handed out over IPC.
     function sanitizedStatus() {
         if (!zabbix.configured)
-            return "zabbix setup-required";
+            return "zabbix setup-required servers=" + servers.length;
         if (!zabbix.hasData) {
             if (zabbix.loading)
-                return "zabbix connecting";
-            return "zabbix unavailable category=" + safeErrorCategory();
+                return "zabbix connecting servers=" + servers.length;
+            return "zabbix unavailable servers=" + servers.length + " category=" + safeErrorCategory();
         }
 
         var parts = ["zabbix"];
+        parts.push("servers=" + servers.length);
+        parts.push("selected=" + selectedServerIds.length);
+        if (zabbix.failingCount > 0)
+            parts.push("failing=" + zabbix.failingCount);
+        if (zabbix.partial)
+            parts.push("partial");
         if (summaryCount === 0)
             parts.push("problems=0");
         else {
@@ -418,6 +604,34 @@ Panel {
         // Collapsed, every cursor stop is a read-only problem row.
         if (!expanded)
             return;
+        if (cursorIndex === addServerCursorIndex) {
+            addServer();
+            return;
+        }
+        if (cursorIndex === insecureTlsCursorIndex) {
+            updateServer(editingServerIndex, {
+                insecureTls: !servers[editingServerIndex].insecureTls
+            });
+            return;
+        }
+        if (cursorIndex === removeServerCursorIndex) {
+            removeServer(editingServerIndex);
+            return;
+        }
+        if (cursorIndex < serverFilterCursorBase) {
+            var row = serverRowForCursor(cursorIndex);
+            if (row >= 0)
+                toggleServerEditor(row);
+            return;
+        }
+        if (cursorIndex < severityCursorBase) {
+            toggleServer(servers[cursorIndex - serverFilterCursorBase].id);
+            return;
+        }
+        if (cursorIndex === refreshIntervalCursorIndex) {
+            refreshIntervalField.field.forceActiveFocus();
+            return;
+        }
         if (cursorIndex >= severityCursorBase && cursorIndex < acknowledgementCursorBase) {
             toggleSeverity(Model.SEVERITIES[cursorIndex - severityCursorBase].value);
             return;
@@ -470,6 +684,23 @@ Panel {
             scrollItemIntoView(problemRepeater.itemAt(cursorIndex - problemCursorBase));
             return;
         }
+        if (cursorIndex === refreshIntervalCursorIndex) {
+            scrollItemIntoView(refreshIntervalField);
+            return;
+        }
+        if (cursorIndex === addServerCursorIndex) {
+            scrollItemIntoView(addServerButton);
+            return;
+        }
+        if (cursorIndex < serverFilterCursorBase) {
+            var row = serverRowForCursor(cursorIndex);
+            scrollItemIntoView(serverRepeater.itemAt(row >= 0 ? row : editingServerIndex));
+            return;
+        }
+        if (cursorIndex < severityCursorBase) {
+            scrollItemIntoView(serverFilterRepeater.itemAt(cursorIndex - serverFilterCursorBase));
+            return;
+        }
         if (cursorIndex < acknowledgementCursorBase)
             scrollItemIntoView(severityRepeater.itemAt(cursorIndex - severityCursorBase));
         else if (cursorIndex < acknowledgedByMeCursorIndex)
@@ -486,6 +717,8 @@ Panel {
     onOpenedChanged: if (opened) {
         cursorActive = false;
         cursorIndex = 0;
+        editingServerIndex = -1;
+        editorFocusCount = 0;
         // Unconfigured widgets have nothing else to show, so their setup
         // notice is never worth hiding behind the Expand button.
         expanded = !zabbix.configured;
@@ -497,7 +730,7 @@ Panel {
     }
     onCursorCountChanged: clampCursor()
 
-    Service {
+    Servers {
         id: zabbix
         settings: root.settings
     }
@@ -626,12 +859,15 @@ Panel {
         bar: root.bar
         open: root.opened
         focusTarget: keyCatcher
-        contentWidth: panel.fittedContentWidth(Style.space(root.expanded ? 640 : 430))
-        contentHeight: panel.fittedContentHeight(contentColumn.implicitHeight, Style.space(root.expanded ? 780 : 640))
+        contentWidth: panel.fittedContentWidth(Style.space(root.expanded ? 700 : 430))
+        contentHeight: panel.fittedContentHeight(contentColumn.implicitHeight, Style.space(root.expanded ? 820 : 640))
 
         PanelKeyCatcher {
             id: keyCatcher
             anchors.fill: parent
+            // A focused server field or spin box must receive its own keys,
+            // including the r/e shortcuts and j/k, so this stands down.
+            blocked: root.editingField
 
             onMoveRequested: function (dx, dy) {
                 root.moveCursor(dx, dy);
@@ -753,6 +989,72 @@ Panel {
 
                     PanelSectionHeader {
                         visible: root.expanded
+                        text: "SERVERS · " + root.servers.length
+                        foreground: root.foreground
+                        fontFamily: root.fontFamily
+                    }
+
+                    Column {
+                        id: serversContent
+                        width: parent.width
+                        visible: root.expanded
+                        spacing: Style.space(6)
+
+                        readonly property real indent: Style.space(10)
+
+                        Text {
+                            visible: root.servers.length === 0
+                            width: serversContent.width
+                            text: "No Zabbix server is configured yet. Add one to start polling."
+                            color: root.dim
+                            font.family: root.fontFamily
+                            font.pixelSize: Style.font.bodySmall
+                            wrapMode: Text.WordWrap
+                        }
+
+                        Repeater {
+                            id: serverRepeater
+                            model: root.serverIdList
+
+                            ServerRow {
+                                required property var modelData
+                                required property int index
+                                width: serversContent.width
+                                server: zabbix.serverFor(modelData)
+                                rowIndex: index
+                            }
+                        }
+
+                        Button {
+                            id: addServerButton
+                            x: serversContent.indent
+                            text: "Add server"
+                            iconText: "󰐕"
+                            bordered: true
+                            hasCursor: root.cursorActive && root.cursorIndex === root.addServerCursorIndex
+                            tooltipText: "Add another Zabbix server to poll"
+                            foreground: root.foreground
+                            fontFamily: root.fontFamily
+                            fontSize: Style.font.bodySmall
+                            iconSize: Style.font.bodySmall
+                            horizontalPadding: Style.space(8)
+                            verticalPadding: Style.space(5)
+
+                            onHovered: function (hovered) {
+                                if (hovered)
+                                    root.setCursor(root.addServerCursorIndex);
+                            }
+                            onClicked: root.addServer()
+                        }
+                    }
+
+                    PanelSeparator {
+                        visible: root.expanded
+                        foreground: root.foreground
+                    }
+
+                    PanelSectionHeader {
+                        visible: root.expanded
                         text: "FILTERS"
                         foreground: root.foreground
                         fontFamily: root.fontFamily
@@ -768,8 +1070,36 @@ Panel {
                         // captioned groups read as its contents, not as peers.
                         readonly property real indent: Style.space(10)
 
+                        // Only worth a row once there is something to choose
+                        // between; one server needs no server filter.
                         FilterGroupLabel {
                             x: filtersContent.indent
+                            visible: root.multiServer
+                            text: "Server"
+                        }
+
+                        Flow {
+                            x: filtersContent.indent
+                            visible: root.multiServer
+                            width: filtersContent.width - filtersContent.indent
+                            spacing: Style.space(6)
+
+                            Repeater {
+                                id: serverFilterRepeater
+                                model: root.multiServer ? root.serverIdList : []
+
+                                ServerChip {
+                                    required property var modelData
+                                    required property int index
+                                    server: zabbix.serverFor(modelData)
+                                    controlIndex: root.serverFilterCursorBase + index
+                                }
+                            }
+                        }
+
+                        FilterGroupLabel {
+                            x: filtersContent.indent
+                            topPadding: root.multiServer ? Style.space(6) : 0
                             text: "Severity"
                         }
 
@@ -890,14 +1220,65 @@ Panel {
                         fontFamily: root.fontFamily
                     }
 
-                    Text {
-                        visible: root.expanded
+                    Column {
                         width: parent.width
-                        text: "Additional settings will appear here in a future update."
-                        color: root.dim
-                        font.family: root.fontFamily
-                        font.pixelSize: Style.font.bodySmall
-                        wrapMode: Text.WordWrap
+                        visible: root.expanded
+                        spacing: Style.space(6)
+
+                        NumberField {
+                            id: refreshIntervalField
+                            x: Style.space(10)
+                            label: "Refresh interval (seconds)"
+                            from: Model.MIN_REFRESH_INTERVAL_SEC
+                            to: Model.MAX_REFRESH_INTERVAL_SEC
+                            stepSize: 15
+                            value: zabbix.refreshIntervalSec
+                            foreground: root.foreground
+                            fontFamily: root.fontFamily
+                            fontSize: Style.font.bodySmall
+                            hasCursor: root.cursorActive && root.cursorIndex === root.refreshIntervalCursorIndex
+
+                            onModified: function (value) {
+                                root.setRefreshInterval(value);
+                            }
+                            onHovered: function (on) {
+                                if (on)
+                                    root.setCursor(root.refreshIntervalCursorIndex);
+                            }
+
+                            // Escape is not consumed by the spin box's own text
+                            // input, so it propagates here and hands the panel
+                            // its keyboard back.
+                            Keys.onPressed: function (event) {
+                                if (event.key !== Qt.Key_Escape)
+                                    return;
+                                root.setRefreshInterval(refreshIntervalField.field.value);
+                                root.releaseFieldFocus();
+                                event.accepted = true;
+                            }
+                        }
+
+                        Connections {
+                            target: refreshIntervalField.field
+
+                            function onActiveFocusChanged() {
+                                if (refreshIntervalField.field.activeFocus) {
+                                    root.beginFieldEdit();
+                                    return;
+                                }
+                                root.endFieldEdit();
+                                root.setRefreshInterval(refreshIntervalField.field.value);
+                            }
+                        }
+
+                        Text {
+                            width: parent.width
+                            text: "The problem limit and the remaining options live in this widget's settings."
+                            color: root.dim
+                            font.family: root.fontFamily
+                            font.pixelSize: Style.font.caption
+                            wrapMode: Text.WordWrap
+                        }
                     }
 
                     PanelSeparator {
@@ -962,7 +1343,7 @@ Panel {
                     Text {
                         visible: zabbix.configured
                         width: parent.width
-                        text: "↑↓/j/k navigate · enter toggle · e expand/compact · r refresh · esc close · tab switch panel"
+                        text: "↑↓/j/k navigate · enter toggle/edit · e expand/compact · r refresh · esc close or leave a field · tab switch panel"
                         color: root.dim
                         font.family: root.fontFamily
                         font.pixelSize: Style.font.caption
@@ -1027,6 +1408,309 @@ Panel {
                 root.setCursor(controlIndex);
         }
         onClicked: toggled()
+    }
+
+    component ServerChip: Button {
+        property var server: null
+        property int controlIndex: 0
+        readonly property bool chosen: server ? root.serverSelected(server.id) : false
+
+        text: server ? String(server.label || "") : ""
+        tooltipText: server ? (String(server.url || "") !== "" ? String(server.url) : "No URL configured") : ""
+        iconText: chosen ? "󰄬" : ""
+        selected: chosen
+        bordered: true
+        hasCursor: root.cursorActive && root.cursorIndex === controlIndex
+        foreground: root.foreground
+        fontFamily: root.fontFamily
+        fontSize: Style.font.bodySmall
+        iconSize: Style.font.bodySmall
+        horizontalPadding: Style.space(8)
+        verticalPadding: Style.space(5)
+
+        onHovered: function (hovered) {
+            if (hovered)
+                root.setCursor(controlIndex);
+        }
+        onClicked: if (server)
+            root.toggleServer(server.id)
+    }
+
+    // Typing breaks a declarative `text:` binding, so the stored value is
+    // pushed in explicitly and only while the field is not being edited.
+    component EditorField: Column {
+        id: editorField
+        property string label: ""
+        property string sourceText: ""
+        property string placeholder: ""
+
+        signal committed(string value)
+
+        spacing: Style.space(3)
+
+        function commit() {
+            if (input.text !== editorField.sourceText)
+                editorField.committed(input.text);
+        }
+
+        onSourceTextChanged: if (!input.activeFocus)
+            input.text = editorField.sourceText
+
+        Text {
+            text: editorField.label
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+        }
+
+        TextField {
+            id: input
+            width: editorField.width
+            placeholderText: editorField.placeholder
+            foreground: root.foreground
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.bodySmall
+            verticalPadding: Style.space(4)
+
+            // Counted separately from activeFocus: a commit can rebuild this
+            // row, and a field destroyed while focused would otherwise leave
+            // the key catcher blocked for good.
+            property bool counted: false
+
+            Component.onCompleted: text = editorField.sourceText
+            Component.onDestruction: if (counted) {
+                counted = false;
+                root.endFieldEdit();
+            }
+
+            onActiveFocusChanged: {
+                if (activeFocus) {
+                    if (counted)
+                        return;
+                    counted = true;
+                    root.beginFieldEdit();
+                    return;
+                }
+                if (!counted)
+                    return;
+                counted = false;
+                root.endFieldEdit();
+                editorField.commit();
+            }
+
+            Keys.onPressed: function (event) {
+                if (event.key === Qt.Key_Escape) {
+                    input.text = editorField.sourceText;
+                    root.releaseFieldFocus();
+                    event.accepted = true;
+                    return;
+                }
+                if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
+                    editorField.commit();
+                    root.releaseFieldFocus();
+                    event.accepted = true;
+                }
+            }
+        }
+    }
+
+    component ServerRow: Column {
+        id: serverRow
+        property var server: null
+        property int rowIndex: 0
+        readonly property bool editing: root.editingServerIndex === rowIndex
+        readonly property int navigationIndex: root.cursorForServerRow(rowIndex)
+        readonly property var serverState: serverRow.server ? zabbix.stateFor(String(serverRow.server.id)) : null
+        readonly property color statusColor: {
+            if (!serverRow.server || serverRow.server.configured !== true)
+                return root.dim;
+            if (!serverRow.serverState)
+                return root.dim;
+            if (String(serverRow.serverState.lastError || "") !== "")
+                return root.urgent;
+            if (serverRow.serverState.hasData === true)
+                return Color.accent;
+            return root.dim;
+        }
+
+        spacing: Style.space(6)
+
+        CursorSurface {
+            id: serverHeader
+            width: serverRow.width
+            hasCursor: root.cursorActive && root.cursorIndex === serverRow.navigationIndex
+            foreground: root.foreground
+            implicitHeight: headerRow.implicitHeight + Style.space(12)
+
+            MouseArea {
+                anchors.fill: parent
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                onEntered: root.setCursor(serverRow.navigationIndex)
+                onClicked: {
+                    root.setCursor(serverRow.navigationIndex);
+                    root.toggleServerEditor(serverRow.rowIndex);
+                }
+            }
+
+            RowLayout {
+                id: headerRow
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                anchors.leftMargin: Style.space(10)
+                anchors.rightMargin: Style.space(10)
+                spacing: Style.space(8)
+
+                Text {
+                    text: serverRow.editing ? "󰅀" : "󰅂"
+                    color: root.dim
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                }
+
+                Text {
+                    text: "●"
+                    color: serverRow.statusColor
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                }
+
+                Text {
+                    text: serverRow.server ? String(serverRow.server.label || "") : ""
+                    color: root.foreground
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.bodySmall
+                    font.bold: true
+                    elide: Text.ElideRight
+                    Layout.maximumWidth: Style.space(160)
+                }
+
+                Text {
+                    Layout.fillWidth: true
+                    text: serverRow.server && String(serverRow.server.url || "") !== "" ? String(serverRow.server.url) : "No URL configured"
+                    color: root.dim
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                    elide: Text.ElideRight
+                    horizontalAlignment: Text.AlignRight
+                }
+            }
+        }
+
+        Column {
+            id: serverEditor
+            visible: serverRow.editing
+            x: Style.space(10)
+            width: serverRow.width - Style.space(20)
+            spacing: Style.space(6)
+
+            EditorField {
+                width: serverEditor.width
+                label: "Name"
+                placeholder: "Optional label for this server"
+                sourceText: serverRow.server ? String(serverRow.server.name || "") : ""
+                onCommitted: function (value) {
+                    root.updateServer(serverRow.rowIndex, {
+                        name: value
+                    });
+                }
+            }
+
+            EditorField {
+                width: serverEditor.width
+                label: "Zabbix URL"
+                placeholder: "https://zabbix.example.com/zabbix"
+                sourceText: serverRow.server ? String(serverRow.server.url || "") : ""
+                onCommitted: function (value) {
+                    root.updateServer(serverRow.rowIndex, {
+                        url: value
+                    });
+                }
+            }
+
+            Text {
+                visible: serverRow.server && String(serverRow.server.endpointError || "") !== "" && String(serverRow.server.url || "") !== ""
+                width: serverEditor.width
+                text: serverRow.server ? String(serverRow.server.endpointError || "") : ""
+                color: root.urgent
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                wrapMode: Text.WordWrap
+            }
+
+            EditorField {
+                width: serverEditor.width
+                label: "API token file"
+                placeholder: Model.DEFAULT_TOKEN_FILE
+                sourceText: serverRow.server ? String(serverRow.server.tokenFile || "") : ""
+                onCommitted: function (value) {
+                    root.updateServer(serverRow.rowIndex, {
+                        tokenFile: value
+                    });
+                }
+            }
+
+            EditorField {
+                width: serverEditor.width
+                label: "Custom CA certificate"
+                placeholder: "Optional PEM trust anchor"
+                sourceText: serverRow.server ? String(serverRow.server.caCertificateFile || "") : ""
+                onCommitted: function (value) {
+                    root.updateServer(serverRow.rowIndex, {
+                        caCertificateFile: value
+                    });
+                }
+            }
+
+            Row {
+                width: serverEditor.width
+                spacing: Style.space(6)
+
+                Button {
+                    text: "Disable TLS verification"
+                    iconText: serverRow.server && serverRow.server.insecureTls === true ? "󰄬" : ""
+                    selected: serverRow.server ? serverRow.server.insecureTls === true : false
+                    bordered: true
+                    hasCursor: root.cursorActive && root.cursorIndex === root.insecureTlsCursorIndex && serverRow.editing
+                    tooltipText: "Unsafe fallback. Prefer a custom CA certificate."
+                    foreground: serverRow.server && serverRow.server.insecureTls === true ? root.urgent : root.foreground
+                    fontFamily: root.fontFamily
+                    fontSize: Style.font.bodySmall
+                    iconSize: Style.font.bodySmall
+                    horizontalPadding: Style.space(8)
+                    verticalPadding: Style.space(5)
+
+                    onHovered: function (hovered) {
+                        if (hovered && serverRow.editing)
+                            root.setCursor(root.insecureTlsCursorIndex);
+                    }
+                    onClicked: root.updateServer(serverRow.rowIndex, {
+                        insecureTls: !(serverRow.server && serverRow.server.insecureTls === true)
+                    })
+                }
+
+                Button {
+                    text: "Remove"
+                    iconText: "󰆴"
+                    bordered: true
+                    hasCursor: root.cursorActive && root.cursorIndex === root.removeServerCursorIndex && serverRow.editing
+                    tooltipText: "Stop polling this server and forget its settings"
+                    foreground: root.urgent
+                    fontFamily: root.fontFamily
+                    fontSize: Style.font.bodySmall
+                    iconSize: Style.font.bodySmall
+                    horizontalPadding: Style.space(8)
+                    verticalPadding: Style.space(5)
+
+                    onHovered: function (hovered) {
+                        if (hovered && serverRow.editing)
+                            root.setCursor(root.removeServerCursorIndex);
+                    }
+                    onClicked: root.removeServer(serverRow.rowIndex)
+                }
+            }
+        }
     }
 
     component SeverityControl: Button {
@@ -1105,6 +1789,20 @@ Panel {
                     font.pixelSize: Style.font.caption
                     font.bold: true
                     elide: Text.ElideRight
+                }
+
+                // In a merged list the severity alone does not say where to
+                // go and fix it, so the server travels with the row.
+                Text {
+                    visible: root.multiServer && text !== ""
+                    text: problemRow.problem ? String(problemRow.problem.serverName || "") : ""
+                    color: root.dim
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                    font.bold: true
+                    elide: Text.ElideRight
+                    Layout.maximumWidth: Style.space(140)
+                    Layout.alignment: Qt.AlignRight | Qt.AlignVCenter
                 }
 
                 Text {
