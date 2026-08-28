@@ -522,15 +522,20 @@ assert.ok(panelSource.indexOf("Model.persistAcknowledgement(next)") >= 0)
 assert.ok(panelSource.indexOf("enabled: root.acknowledgedByMeEnabled") >= 0)
 assert.ok(panelSource.indexOf('acknowledgedByMeEnabled: acknowledgement === "acknowledged"') >= 0)
 assert.ok(panelSource.indexOf('label: "Unmonitored"') >= 0)
-// Warnings and filters collapse so the problem list gets the panel's height,
-// and the disclosure state is panel-local: every open starts collapsed.
-assert.ok(panelSource.indexOf("component DisclosureHeader") >= 0)
-// Severity and acknowledgement live under one FILTERS disclosure, each row
-// captioned so the chips are not an unlabelled pile.
+// The normal panel shows only the hero and problems; an Expand button (or
+// `e`) grows it to also reveal warnings, filters, and a reserved future
+// options section, and the expand state is panel-local: every open resets
+// it (except an unconfigured widget, which opens already expanded).
+assert.ok(panelSource.indexOf("property bool expanded: false") >= 0)
+assert.ok(panelSource.indexOf("root.expanded = !root.expanded") >= 0)
+assert.ok(panelSource.indexOf('text: "FILTERS"') >= 0)
+assert.ok(panelSource.indexOf('text: "MORE OPTIONS"') >= 0)
+// Severity and acknowledgement live under FILTERS, each row captioned so
+// the chips are not an unlabelled pile.
 assert.ok(panelSource.indexOf('text: "Severity"') >= 0)
 assert.ok(panelSource.indexOf('text: "Acknowledgement"') >= 0)
 assert.ok(panelSource.indexOf("component FilterGroupLabel") >= 0)
-assert.ok(/onOpenedChanged: if \(opened\) \{[^}]*noticesExpanded = false;[^}]*filtersExpanded = false;/.test(panelSource))
+assert.ok(/onOpenedChanged: if \(opened\) \{[^}]*expanded = !zabbix\.configured;/.test(panelSource))
 // Progress state lives on the hero meta line, not in a banner.
 assert.strictEqual(panelSource.indexOf("Refreshing problems; the last complete result remains visible."), -1)
 assert.strictEqual(panelSource.indexOf("Waiting for the first problem refresh."), -1)

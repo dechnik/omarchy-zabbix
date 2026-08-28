@@ -211,8 +211,7 @@ omarchy bar set dechnik.zabbix insecureTls false
 | Right click the bar widget | Request an immediate refresh without opening the panel. |
 | Hover the bar widget | Show the highest-severity summary and stale, truncation, or insecure-TLS state. |
 | Click the panel refresh button | Request an immediate refresh. |
-| Click the warnings row | Expand or collapse the full warning text. |
-| Click `FILTERS` | Expand or collapse the severity and acknowledgement controls. |
+| Click the panel Expand/Compact button | Show or hide the warnings, filters, and more-options sections alongside the problem list. |
 | Click a severity | Include or exclude it; the final selected severity cannot be removed. |
 | Click an acknowledgement state | Show `All`, `Unacknowledged`, or `Acknowledged` problems. |
 | Click *only acknowledged by me* | Narrow `Acknowledged` to your own acknowledgements. Dimmed and inert on the other two states. |
@@ -221,21 +220,25 @@ omarchy bar set dechnik.zabbix insecureTls false
 
 ### Panel Layout
 
-The panel spends its height on problems. Warnings collapse to a single counted
-row (`⚠ 2 warnings`) and the severity and acknowledgement controls collapse
-under one `FILTERS` row; both start collapsed every time the panel opens and
-expand on click or `Enter`. The collapsed state is panel-local — it is not a
-setting and is never written to `shell.json`.
+The normal panel shows only the header and the problem list — nothing else
+competes with problems for space. An Expand button in the header (or the `e`
+key) grows the panel and reveals, above the still-visible problem list: a
+`WARNINGS` section (only present when there is something to say), a
+`FILTERS` section, and a `MORE OPTIONS` section reserved for future
+settings. A Compact button (or `e` again) shrinks the panel back to
+problems-only. This expand state is panel-local — it is not a setting and is
+never written to `shell.json`, and it resets to collapsed every time the
+panel opens.
 
-Expanding `FILTERS` reveals three captioned control groups: `Severity`,
+The `FILTERS` section has three captioned control groups: `Severity`,
 `Acknowledgement`, and `Include` (suppressed, symptom, and unmonitored
 problems). The six severity chips use short labels
 (`NC`, `Info`, `Warn`, `Avg`, `High`, `Disaster`) to fit one row; hover a chip
 for the full severity name.
 
-Two exceptions to the collapsing: an unconfigured widget forces its setup
-notice open, because a bare `⚠ 1 warning` would hide the only thing worth
-saying. Refresh progress gets no banner at all — and no bar indication
+One exception to starting collapsed: an unconfigured widget opens already
+expanded, because a bare header would hide the only thing worth saying — its
+setup notice. Refresh progress gets no banner at all — and no bar indication
 either: a poll every `refreshIntervalSec` is background noise, not a state to
 act on. The header meta line still reads `Connecting`, `Loading problems`, or
 `Waiting for data` while the panel is open, and the bar carries a glyph only
@@ -255,8 +258,9 @@ on, matching what the Zabbix frontend lists.
 
 | Key | Action |
 |---|---|
-| `Up` / `Down` or `j` / `k` | Move through the warnings row, the `FILTERS` row, and problem rows. While `FILTERS` is expanded the six severity controls, the three acknowledgement controls, *only acknowledged by me*, and the three *Include* controls join the path between them. |
-| `Enter` | Expand or collapse the focused warnings or `FILTERS` row, toggle the focused severity or *Include* control, select the focused acknowledgement state, or toggle *only acknowledged by me*. Problem rows have no activation action. |
+| `Up` / `Down` or `j` / `k` | Move through problem rows. While the panel is expanded, the six severity controls, the three acknowledgement controls, *only acknowledged by me*, and the three *Include* controls join the path before the problem rows. |
+| `Enter` | While expanded: toggle the focused severity or *Include* control, select the focused acknowledgement state, or toggle *only acknowledged by me*. Problem rows have no activation action. |
+| `e` | Expand or collapse the panel. |
 | `r` | Request an immediate refresh. |
 | `Esc` | Close the panel. |
 | `Tab` / `Shift+Tab` | Switch to the next/previous panel in the same bar section and monitor. |

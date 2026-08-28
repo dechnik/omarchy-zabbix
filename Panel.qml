@@ -17,10 +17,9 @@ Panel {
     property int cursorIndex: 0
     property bool cursorActive: false
 
-    // Disclosure state is deliberately panel-local and resets on every open:
-    // the panel exists to show problems, so the chrome starts out of the way.
-    property bool noticesExpanded: false
-    property bool filtersExpanded: false
+    // Expand state is deliberately panel-local and resets on every open: the
+    // panel exists to show problems, so the chrome starts out of the way.
+    property bool expanded: false
 
     readonly property color foreground: bar ? bar.foreground : Color.foreground
     readonly property color barTextColor: bar ? bar.barForeground : Color.foreground
@@ -45,19 +44,14 @@ Panel {
     readonly property color summaryColor: summaryAvailable && summaryCount > 0 && summarySeverity ? summarySeverity.color : dim
     readonly property var notices: noticeList()
     readonly property bool hasNotices: notices.length > 0
-    // An unconfigured widget has nothing else to show, so its setup notice is
-    // never worth hiding behind a count.
-    readonly property bool noticesOpen: hasNotices && (noticesExpanded || !zabbix.configured)
 
-    readonly property int noticesCursorIndex: hasNotices ? 0 : -1
-    readonly property int filtersCursorIndex: hasNotices ? 1 : 0
-    readonly property int severityCursorBase: filtersCursorIndex + 1
+    readonly property int severityCursorBase: 0
     readonly property int acknowledgementCursorBase: severityCursorBase + Model.SEVERITIES.length
     readonly property int acknowledgedByMeCursorIndex: acknowledgementCursorBase + Model.ACKNOWLEDGEMENTS.length
     readonly property int showSuppressedCursorIndex: acknowledgedByMeCursorIndex + 1
     readonly property int showSymptomsCursorIndex: showSuppressedCursorIndex + 1
     readonly property int showUnmonitoredCursorIndex: showSymptomsCursorIndex + 1
-    readonly property int problemCursorBase: filtersExpanded ? showUnmonitoredCursorIndex + 1 : severityCursorBase
+    readonly property int problemCursorBase: expanded ? showUnmonitoredCursorIndex + 1 : 0
     readonly property int cursorCount: problemCursorBase + visibleProblems.length
     // Refreshing is routine background noise; only stale data earns a bar glyph.
     readonly property string activityGlyph: zabbix.stale ? "󰅖" : ""
@@ -129,18 +123,6 @@ Panel {
                 urgent: true
             });
         return list;
-    }
-
-    function noticeSummary() {
-        var count = notices.length;
-        return count + (count === 1 ? " warning" : " warnings");
-    }
-
-    function noticesUrgent() {
-        for (var i = 0; i < notices.length; i++)
-            if (notices[i].urgent)
-                return true;
-        return false;
     }
 
     function severitySelected(value) {
@@ -433,17 +415,8 @@ Panel {
     function activateCursor() {
         if (!cursorActive)
             return;
-        if (hasNotices && cursorIndex === noticesCursorIndex) {
-            noticesExpanded = !noticesExpanded;
-            return;
-        }
-        if (cursorIndex === filtersCursorIndex) {
-            filtersExpanded = !filtersExpanded;
-            return;
-        }
-        // Collapsed filters contribute no cursor stops; everything past the
-        // header is a read-only problem row.
-        if (!filtersExpanded)
+        // Collapsed, every cursor stop is a read-only problem row.
+        if (!expanded)
             return;
         if (cursorIndex >= severityCursorBase && cursorIndex < acknowledgementCursorBase) {
             toggleSeverity(Model.SEVERITIES[cursorIndex - severityCursorBase].value);
@@ -497,14 +470,6 @@ Panel {
             scrollItemIntoView(problemRepeater.itemAt(cursorIndex - problemCursorBase));
             return;
         }
-        if (hasNotices && cursorIndex === noticesCursorIndex) {
-            scrollItemIntoView(noticesHeader);
-            return;
-        }
-        if (cursorIndex === filtersCursorIndex) {
-            scrollItemIntoView(filtersHeader);
-            return;
-        }
         if (cursorIndex < acknowledgementCursorBase)
             scrollItemIntoView(severityRepeater.itemAt(cursorIndex - severityCursorBase));
         else if (cursorIndex < acknowledgedByMeCursorIndex)
@@ -521,8 +486,9 @@ Panel {
     onOpenedChanged: if (opened) {
         cursorActive = false;
         cursorIndex = 0;
-        noticesExpanded = false;
-        filtersExpanded = false;
+        // Unconfigured widgets have nothing else to show, so their setup
+        // notice is never worth hiding behind the Expand button.
+        expanded = !zabbix.configured;
         nowMs = Date.now();
         if (panelFlick)
             panelFlick.contentY = 0;
@@ -660,8 +626,8 @@ Panel {
         bar: root.bar
         open: root.opened
         focusTarget: keyCatcher
-        contentWidth: panel.fittedContentWidth(Style.space(430))
-        contentHeight: panel.fittedContentHeight(contentColumn.implicitHeight, Style.space(640))
+        contentWidth: panel.fittedContentWidth(Style.space(root.expanded ? 640 : 430))
+        contentHeight: panel.fittedContentHeight(contentColumn.implicitHeight, Style.space(root.expanded ? 780 : 640))
 
         PanelKeyCatcher {
             id: keyCatcher
@@ -676,8 +642,11 @@ Panel {
                 root.switchPanel(direction);
             }
             onTextKey: function (text) {
-                if (String(text).toLowerCase() === "r")
+                var key = String(text).toLowerCase();
+                if (key === "r")
                     zabbix.refresh(true);
+                else if (key === "e")
+                    root.expanded = !root.expanded;
             }
 
             Flickable {
@@ -712,7 +681,6 @@ Panel {
                             width: parent.width
                             title: "Zabbix problems"
                             meta: root.headerMeta()
-                            detail: root.summaryAvailable ? String(root.visibleProblems.length) : ""
                             foreground: root.foreground
                             fontFamily: root.fontFamily
                             iconOpacity: zabbix.loading ? 0.55 : 1
@@ -727,34 +695,44 @@ Panel {
                             }
 
                             trailingControl: Component {
-                                PanelActionButton {
-                                    iconText: "󰑐"
-                                    tooltipText: "Refresh Zabbix problems  (r)"
-                                    foreground: hero.foreground
-                                    fontFamily: hero.fontFamily
-                                    enabled: !heroBox.busy
-                                    onClicked: heroBox.refresh()
+                                Row {
+                                    spacing: Style.space(4)
+
+                                    PanelActionButton {
+                                        iconText: "󰑐"
+                                        tooltipText: "Refresh Zabbix problems  (r)"
+                                        foreground: hero.foreground
+                                        fontFamily: hero.fontFamily
+                                        enabled: !heroBox.busy
+                                        onClicked: heroBox.refresh()
+                                    }
+
+                                    PanelActionButton {
+                                        iconText: root.expanded ? "󰊔" : "󰊓"
+                                        tooltipText: root.expanded ? "Show only problems  (e)" : "Show warnings, filters, and more  (e)"
+                                        foreground: hero.foreground
+                                        fontFamily: hero.fontFamily
+                                        onClicked: root.expanded = !root.expanded
+                                    }
                                 }
                             }
                         }
                     }
 
-                    DisclosureHeader {
-                        id: noticesHeader
-                        visible: root.hasNotices
-                        label: root.noticeSummary()
-                        glyph: root.noticesUrgent() ? "󰀦" : ""
-                        tone: root.noticesUrgent() ? root.urgent : root.dim
-                        expanded: root.noticesOpen
-                        // Forced open while unconfigured; no point offering a toggle.
-                        toggleable: zabbix.configured
-                        cursorTargetIndex: root.noticesCursorIndex
-                        onToggled: root.noticesExpanded = !root.noticesExpanded
+                    PanelSeparator {
+                        foreground: root.foreground
+                    }
+
+                    PanelSectionHeader {
+                        visible: root.expanded && root.hasNotices
+                        text: "WARNINGS · " + root.notices.length
+                        foreground: root.foreground
+                        fontFamily: root.fontFamily
                     }
 
                     Column {
                         width: parent.width
-                        visible: root.noticesOpen
+                        visible: root.expanded && root.hasNotices
                         spacing: Style.space(8)
 
                         Repeater {
@@ -769,22 +747,21 @@ Panel {
                     }
 
                     PanelSeparator {
+                        visible: root.expanded && root.hasNotices
                         foreground: root.foreground
                     }
 
-                    DisclosureHeader {
-                        id: filtersHeader
-                        label: "FILTERS"
-                        tone: root.dim
-                        expanded: root.filtersExpanded
-                        cursorTargetIndex: root.filtersCursorIndex
-                        onToggled: root.filtersExpanded = !root.filtersExpanded
+                    PanelSectionHeader {
+                        visible: root.expanded
+                        text: "FILTERS"
+                        foreground: root.foreground
+                        fontFamily: root.fontFamily
                     }
 
                     Column {
                         id: filtersContent
                         width: parent.width
-                        visible: root.filtersExpanded
+                        visible: root.expanded
                         spacing: Style.space(6)
 
                         // Indented one step under the FILTERS header so the two
@@ -902,6 +879,28 @@ Panel {
                     }
 
                     PanelSeparator {
+                        visible: root.expanded
+                        foreground: root.foreground
+                    }
+
+                    PanelSectionHeader {
+                        visible: root.expanded
+                        text: "MORE OPTIONS"
+                        foreground: root.foreground
+                        fontFamily: root.fontFamily
+                    }
+
+                    Text {
+                        visible: root.expanded
+                        width: parent.width
+                        text: "Additional settings will appear here in a future update."
+                        color: root.dim
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.bodySmall
+                        wrapMode: Text.WordWrap
+                    }
+
+                    PanelSeparator {
                         foreground: root.foreground
                     }
 
@@ -963,7 +962,7 @@ Panel {
                     Text {
                         visible: zabbix.configured
                         width: parent.width
-                        text: "↑↓/j/k navigate · enter expand or toggle · r refresh · esc close · tab switch panel"
+                        text: "↑↓/j/k navigate · enter toggle · e expand/compact · r refresh · esc close · tab switch panel"
                         color: root.dim
                         font.family: root.fontFamily
                         font.pixelSize: Style.font.caption
@@ -978,70 +977,6 @@ Panel {
         color: root.dim
         font.family: root.fontFamily
         font.pixelSize: Style.font.caption
-    }
-
-    component DisclosureHeader: CursorSurface {
-        id: disclosure
-        property string label: ""
-        property string glyph: ""
-        property color tone: root.dim
-        property bool expanded: false
-        property bool toggleable: true
-        property int cursorTargetIndex: -1
-
-        signal toggled
-
-        width: parent ? parent.width : implicitWidth
-        hasCursor: root.cursorActive && cursorTargetIndex >= 0 && root.cursorIndex === cursorTargetIndex
-        foreground: root.foreground
-        implicitHeight: disclosureLabel.implicitHeight + Style.space(12)
-
-        MouseArea {
-            anchors.fill: parent
-            hoverEnabled: true
-            cursorShape: disclosure.toggleable ? Qt.PointingHandCursor : Qt.ArrowCursor
-            onEntered: if (disclosure.cursorTargetIndex >= 0)
-                root.setCursor(disclosure.cursorTargetIndex)
-            onClicked: if (disclosure.toggleable)
-                disclosure.toggled()
-        }
-
-        Row {
-            anchors.left: parent.left
-            anchors.leftMargin: Style.space(8)
-            anchors.verticalCenter: parent.verticalCenter
-            spacing: Style.space(6)
-
-            Text {
-                visible: disclosure.glyph !== ""
-                text: disclosure.glyph
-                color: disclosure.tone
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-                anchors.verticalCenter: parent.verticalCenter
-            }
-
-            Text {
-                id: disclosureLabel
-                text: disclosure.label
-                color: disclosure.tone
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-                font.bold: true
-                anchors.verticalCenter: parent.verticalCenter
-            }
-        }
-
-        Text {
-            anchors.right: parent.right
-            anchors.rightMargin: Style.space(8)
-            anchors.verticalCenter: parent.verticalCenter
-            visible: disclosure.toggleable
-            text: disclosure.expanded ? "󰅀" : "󰅂"
-            color: root.dim
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.caption
-        }
     }
 
     component StateNotice: BorderSurface {
