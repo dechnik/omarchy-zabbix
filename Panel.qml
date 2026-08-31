@@ -795,6 +795,7 @@ Panel {
             spacing: Style.space(4)
 
             Text {
+                textFormat: Text.PlainText
                 text: "󰀦"
                 color: root.summaryColor
                 font.family: root.fontFamily
@@ -803,6 +804,7 @@ Panel {
             }
 
             Text {
+                textFormat: Text.PlainText
                 text: root.barCount
                 color: root.summaryAvailable ? root.barTextColor : Qt.darker(root.barTextColor, 1.5)
                 font.family: root.fontFamily
@@ -812,6 +814,7 @@ Panel {
             }
 
             Text {
+                textFormat: Text.PlainText
                 visible: root.activityGlyph !== ""
                 text: root.activityGlyph
                 color: Qt.darker(root.barTextColor, 1.5)
@@ -826,6 +829,7 @@ Panel {
             anchors.fill: parent
 
             Text {
+                textFormat: Text.PlainText
                 width: parent.width
                 height: Style.bar.iconSlot
                 text: "󰀦"
@@ -838,6 +842,7 @@ Panel {
             }
 
             Text {
+                textFormat: Text.PlainText
                 width: parent.width
                 height: Style.bar.iconSlot
                 text: root.barCount + (root.activityGlyph !== "" ? " " + root.activityGlyph : "")
@@ -923,6 +928,7 @@ Panel {
 
                             iconComponent: Component {
                                 Text {
+                                    textFormat: Text.PlainText
                                     text: "󰀦"
                                     color: root.summaryColor
                                     font.family: root.fontFamily
@@ -1003,6 +1009,7 @@ Panel {
                         readonly property real indent: Style.space(10)
 
                         Text {
+                            textFormat: Text.PlainText
                             visible: root.servers.length === 0
                             width: serversContent.width
                             text: "No Zabbix server is configured yet. Add one to start polling."
@@ -1272,6 +1279,7 @@ Panel {
                         }
 
                         Text {
+                            textFormat: Text.PlainText
                             width: parent.width
                             text: "The problem limit and the remaining options live in this widget's settings."
                             color: root.dim
@@ -1300,6 +1308,7 @@ Panel {
 
                         Text {
                             id: freshness
+                            textFormat: Text.PlainText
                             anchors.right: parent.right
                             anchors.verticalCenter: parent.verticalCenter
                             text: zabbix.lastUpdatedMs > 0 ? root.freshnessText() : ""
@@ -1310,6 +1319,7 @@ Panel {
                     }
 
                     Text {
+                        textFormat: Text.PlainText
                         visible: zabbix.hasData && root.visibleProblems.length === 0
                         width: parent.width
                         text: "No unresolved problems match the selected filters."
@@ -1341,6 +1351,7 @@ Panel {
                     }
 
                     Text {
+                        textFormat: Text.PlainText
                         visible: zabbix.configured
                         width: parent.width
                         text: "↑↓/j/k navigate · enter toggle/edit · e expand/compact · r refresh · esc close or leave a field · tab switch panel"
@@ -1355,6 +1366,7 @@ Panel {
     }
 
     component FilterGroupLabel: Text {
+        textFormat: Text.PlainText
         color: root.dim
         font.family: root.fontFamily
         font.pixelSize: Style.font.caption
@@ -1373,6 +1385,7 @@ Panel {
 
         Text {
             id: noticeText
+            textFormat: Text.PlainText
             anchors.fill: parent
             anchors.margins: Style.space(8)
             text: notice.message
@@ -1457,6 +1470,7 @@ Panel {
             input.text = editorField.sourceText
 
         Text {
+            textFormat: Text.PlainText
             text: editorField.label
             color: root.dim
             font.family: root.fontFamily
@@ -1563,6 +1577,7 @@ Panel {
                 spacing: Style.space(8)
 
                 Text {
+                    textFormat: Text.PlainText
                     text: serverRow.editing ? "󰅀" : "󰅂"
                     color: root.dim
                     font.family: root.fontFamily
@@ -1570,6 +1585,7 @@ Panel {
                 }
 
                 Text {
+                    textFormat: Text.PlainText
                     text: "●"
                     color: serverRow.statusColor
                     font.family: root.fontFamily
@@ -1577,6 +1593,7 @@ Panel {
                 }
 
                 Text {
+                    textFormat: Text.PlainText
                     text: serverRow.server ? String(serverRow.server.label || "") : ""
                     color: root.foreground
                     font.family: root.fontFamily
@@ -1587,6 +1604,7 @@ Panel {
                 }
 
                 Text {
+                    textFormat: Text.PlainText
                     Layout.fillWidth: true
                     text: serverRow.server && String(serverRow.server.url || "") !== "" ? String(serverRow.server.url) : "No URL configured"
                     color: root.dim
@@ -1630,6 +1648,7 @@ Panel {
             }
 
             Text {
+                textFormat: Text.PlainText
                 visible: serverRow.server && String(serverRow.server.endpointError || "") !== "" && String(serverRow.server.url || "") !== ""
                 width: serverEditor.width
                 text: serverRow.server ? String(serverRow.server.endpointError || "") : ""
@@ -1782,6 +1801,7 @@ Panel {
                 spacing: Style.space(8)
 
                 Text {
+                    textFormat: Text.PlainText
                     Layout.fillWidth: true
                     text: problemRow.severity ? root.severityLabel(problemRow.severity) : "Unknown severity"
                     color: problemRow.severity ? problemRow.severity.color : root.dim
@@ -1794,6 +1814,7 @@ Panel {
                 // In a merged list the severity alone does not say where to
                 // go and fix it, so the server travels with the row.
                 Text {
+                    textFormat: Text.PlainText
                     visible: root.multiServer && text !== ""
                     text: problemRow.problem ? String(problemRow.problem.serverName || "") : ""
                     color: root.dim
@@ -1806,6 +1827,7 @@ Panel {
                 }
 
                 Text {
+                    textFormat: Text.PlainText
                     text: root.ageText(problemRow.problem ? problemRow.problem.clock : 0)
                     color: root.dim
                     font.family: root.fontFamily
@@ -1815,6 +1837,7 @@ Panel {
             }
 
             Text {
+                textFormat: Text.PlainText
                 width: parent.width
                 text: problemRow.problem ? String(problemRow.problem.name || "Unnamed problem") : ""
                 color: root.foreground
@@ -1825,6 +1848,7 @@ Panel {
             }
 
             Text {
+                textFormat: Text.PlainText
                 width: parent.width
                 text: root.hostsText(problemRow.problem)
                 color: text === "Hosts unavailable" ? root.urgent : root.dim
@@ -1839,6 +1863,7 @@ Panel {
 
                 Text {
                     id: acknowledged
+                    textFormat: Text.PlainText
                     visible: problemRow.problem && problemRow.problem.acknowledged === true
                     text: "ACKNOWLEDGED"
                     color: root.dim
@@ -1849,6 +1874,7 @@ Panel {
 
                 Text {
                     id: suppressed
+                    textFormat: Text.PlainText
                     visible: problemRow.problem && problemRow.problem.suppressed === true
                     text: "SUPPRESSED"
                     color: root.dim
