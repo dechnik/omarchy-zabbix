@@ -146,6 +146,44 @@ assert.strictEqual(Model.classifyCurlResult(3, "", "").category, "endpoint")
 assert.strictEqual(Model.classifyCurlResult(127, "", "").category, "transport")
 assert.strictEqual(Model.classifyCurlResult(0, "redirect\n" + Model.CURL_STATUS_MARKER + "302", "").category, "endpoint")
 assert.strictEqual(Model.classifyCurlResult(0, "server\n" + Model.CURL_STATUS_MARKER + "500", "").category, "http")
+// The response is capped while it is still arriving: curl refuses a declared
+// oversize body (63), and loses the pipe when `head` stops reading (23/141).
+assert.strictEqual(Model.classifyCurlResult(63, "", "").category, "response-size")
+assert.strictEqual(Model.classifyCurlResult(23, "partial", "").category, "response-size")
+assert.strictEqual(Model.classifyCurlResult(141, "partial", "").category, "response-size")
+
+// Both caps have to reach the script, and both streams have to run through a
+// bounded reader rather than being collected whole.
+var curlEnvironment = Model.buildCurlEnvironment("https://z.example", "{}", "token", { authenticated: true })
+assert.strictEqual(curlEnvironment.ZABBIX_MAX_BODY_BYTES, String(Model.MAX_RESPONSE_BYTES))
+assert.strictEqual(curlEnvironment.ZABBIX_MAX_STDERR_BYTES, String(Model.MAX_STDERR_BYTES))
+assert.ok(Model.FETCH_SCRIPT.indexOf("set -euo pipefail") >= 0)
+assert.ok(Model.FETCH_SCRIPT.indexOf('head -c "$ZABBIX_MAX_BODY_BYTES"') >= 0)
+assert.ok(Model.FETCH_SCRIPT.indexOf('head -c "$ZABBIX_MAX_STDERR_BYTES" >&2') >= 0)
+assert.ok(Model.FETCH_SCRIPT.indexOf("max-filesize") >= 0)
+
+// Strings and lists the API controls are truncated on the way into the model.
+assert.strictEqual(Model.boundedText(new Array(900).join("x")).length, Model.MAX_TEXT_LENGTH)
+assert.strictEqual(Model.boundedText("  spaced  "), "spaced")
+var floodTags = []
+for (var tagIndex = 0; tagIndex < Model.MAX_TAGS_PER_PROBLEM + 10; tagIndex++) {
+  floodTags.push({ tag: "t" + tagIndex, value: new Array(900).join("v") })
+}
+var floodedProblem = Model.normalizeProblemResult([{
+  eventid: "1", objectid: "2", severity: 3, clock: 100,
+  name: new Array(900).join("n"), tags: floodTags
+}], 10).problems[0]
+assert.strictEqual(floodedProblem.tags.length, Model.MAX_TAGS_PER_PROBLEM)
+assert.strictEqual(floodedProblem.name.length, Model.MAX_TEXT_LENGTH)
+assert.strictEqual(floodedProblem.tags[0].value.length, Model.MAX_TEXT_LENGTH)
+
+var floodHosts = []
+for (var hostIndex = 0; hostIndex < Model.MAX_HOSTS_PER_TRIGGER + 10; hostIndex++) {
+  floodHosts.push({ hostid: String(hostIndex + 1), name: new Array(900).join("h") })
+}
+var floodedHosts = Model.normalizeHosts([{ triggerid: "2", hosts: floodHosts }])["2"]
+assert.strictEqual(floodedHosts.length, Model.MAX_HOSTS_PER_TRIGGER)
+assert.strictEqual(floodedHosts[0].name.length, Model.MAX_TEXT_LENGTH)
 
 // Exact JSON-RPC request shapes.
 assert.deepStrictEqual(Model.buildApiInfoVersionRequest(), {
@@ -161,13 +199,20 @@ assert.deepStrictEqual(Model.buildProblemCensusRequest({ severities: [5, 4, 5] }
     recent: false,
     severities: [4, 5],
     sortfield: ["eventid"],
-    sortorder: "DESC"
+    sortorder: "DESC",
+    limit: Model.MAX_CENSUS_ROWS
   },
   id: 2
 })
-// The census is deliberately unlimited: ranking needs the whole set before it
-// can know which problems are worth fetching in full.
-assert.strictEqual(Model.buildProblemCensusRequest({}).params.limit, undefined)
+// Ranking wants the whole set, but the bar decides how much of it it is
+// willing to hold: the census is capped server-side and ranked inside that
+// window, and normalizeCensus refuses more than the cap whatever arrives.
+assert.strictEqual(Model.buildProblemCensusRequest({}).params.limit, Model.MAX_CENSUS_ROWS)
+var floodCensus = []
+for (var flood = 0; flood < Model.MAX_CENSUS_ROWS + 25; flood++) {
+  floodCensus.push({ eventid: String(flood + 1), objectid: "7", severity: 3, clock: 1000 + flood })
+}
+assert.strictEqual(Model.normalizeCensus(floodCensus).length, Model.MAX_CENSUS_ROWS)
 
 assert.deepStrictEqual(Model.buildProblemDetailRequest(["9", "8", "9", "bad", "0"]), {
   jsonrpc: "2.0",
@@ -517,6 +562,9 @@ assert.ok(panelSource.indexOf("updateEntryInline(moduleName, entry)") >= 0)
 assert.ok(panelSource.indexOf("function status(): string") >= 0)
 assert.strictEqual(panelSource.indexOf("zabbix.token"), -1)
 assert.ok(panelSource.indexOf("Model.ACKNOWLEDGEMENTS") >= 0)
+// Adding past the cap would create a row normalizeServers then drops.
+assert.ok(panelSource.indexOf("if (list.length >= Model.MAX_SERVERS)") >= 0)
+assert.ok(panelSource.indexOf('"response-size": "Zabbix response too large"') >= 0)
 assert.ok(panelSource.indexOf("Model.persistAcknowledgement(next)") >= 0)
 // The by-me control must stay inert unless the acknowledged state is selected.
 assert.ok(panelSource.indexOf("enabled: root.acknowledgedByMeEnabled") >= 0)
@@ -647,6 +695,14 @@ assert.strictEqual(legacy[0].insecureTls, true)
 // An empty servers array must not resurrect the legacy keys' absence as a server.
 assert.deepStrictEqual(Model.normalizeServers({ servers: [] }, "/home/u"), [])
 assert.deepStrictEqual(Model.normalizeServers({}, "/home/u"), [])
+
+// Each configured server runs its own poll process, so a hand-edited file
+// cannot start more of them than the cap allows.
+var manyServers = []
+for (var serverIndex = 0; serverIndex < Model.MAX_SERVERS + 5; serverIndex++) {
+  manyServers.push({ url: "https://s" + serverIndex + ".test" })
+}
+assert.strictEqual(Model.normalizeServers({ servers: manyServers }, "/home/u").length, Model.MAX_SERVERS)
 // A servers array wins over leftover legacy keys.
 assert.strictEqual(Model.normalizeServers({ url: "https://old.test", servers: [{ id: "s4", url: "https://new.test" }] }, "/home/u")[0].id, "s4")
 

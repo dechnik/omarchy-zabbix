@@ -14,6 +14,18 @@ var MAX_BACKOFF_MS = 900000
 var CLAIM_TIMEOUT_MS = 45000
 var CURL_STATUS_MARKER = "__ZABBIX_HTTP_STATUS__:"
 
+// Nothing the API returns is trusted to be small. The response is capped
+// while it is still being received, and every list and string that survives
+// into the model is capped again, so a hostile or broken server costs a fixed
+// amount of memory rather than whatever it feels like sending.
+var MAX_RESPONSE_BYTES = 8388608
+var MAX_STDERR_BYTES = 4096
+var MAX_SERVERS = 16
+var MAX_CENSUS_ROWS = 5000
+var MAX_HOSTS_PER_TRIGGER = 20
+var MAX_TAGS_PER_PROBLEM = 20
+var MAX_TEXT_LENGTH = 512
+
 // The census asks only what ranking needs; detail is fetched for the survivors.
 var CENSUS_OUTPUT = ["eventid", "objectid", "severity", "clock"]
 
@@ -48,6 +60,14 @@ function text(value) {
 
 function trim(value) {
   return text(value).replace(/^\s+|\s+$/g, "")
+}
+
+// API strings end up in labels, tooltips and the merged model, so they are
+// truncated on the way in rather than trusted to be a sane length.
+function boundedText(value, maximum) {
+  var raw = trim(value)
+  var limit = maximum === undefined ? MAX_TEXT_LENGTH : maximum
+  return raw.length > limit ? raw.substring(0, limit) : raw
 }
 
 function clampInteger(value, fallback, minimum, maximum) {
@@ -307,7 +327,10 @@ function normalizeServers(settings, home) {
   var list = arrayLike(source.servers) || []
   var output = []
   var seen = {}
-  for (var i = 0; i < list.length; i++) {
+  // Every configured server becomes a Service with its own curl process, so
+  // the list is capped rather than letting a hand-edited shell.json start an
+  // unbounded number of them.
+  for (var i = 0; i < list.length && output.length < MAX_SERVERS; i++) {
     var entry = list[i]
     if (!entry || typeof entry !== "object") continue
     var server = normalizeServer(entry, home, output.length)
@@ -699,20 +722,33 @@ function curlConfigEscape(value) {
   return raw.replace(/\\/g, "\\\\").replace(/"/g, "\\\"")
 }
 
+// Time is not the only thing worth bounding: `head` closes the pipe once the
+// response passes ZABBIX_MAX_BODY_BYTES, so curl is stopped mid-transfer with
+// a write error instead of the collector growing without limit. curl's own
+// diagnostics go through a second cap on their way to stderr. `pipefail` is
+// what carries curl's exit code out through both of them.
+//
+// The fd dance: fd 4 is the capped stdout, so curl's stdout leaves the inner
+// group on 4 while its stderr takes that group's stdout into the stderr cap.
 var FETCH_SCRIPT = [
-  "set -eu",
+  "set -euo pipefail",
   "{",
-  "  printf '%s\\n' 'url = \"'\"$ZABBIX_URL\"'\"'",
-  "  printf '%s\\n' 'request = \"POST\"'",
-  "  printf '%s\\n' 'header = \"Content-Type: application/json\"'",
-  "  if [ \"$ZABBIX_AUTH\" = 1 ]; then printf '%s\\n' 'header = \"Authorization: Bearer '\"$ZABBIX_TOKEN\"'\"'; fi",
-  "  printf '%s\\n' 'data = \"'\"$ZABBIX_BODY\"'\"'",
-  "  printf '%s\\n' 'connect-timeout = \"'\"$ZABBIX_CONNECT_TIMEOUT\"'\"'",
-  "  printf '%s\\n' 'max-time = \"'\"$ZABBIX_TOTAL_TIMEOUT\"'\"'",
-  "  if [ -n \"$ZABBIX_CA_FILE\" ]; then printf '%s\\n' 'cacert = \"'\"$ZABBIX_CA_FILE\"'\"'; fi",
-  "  if [ \"$ZABBIX_INSECURE\" = 1 ]; then printf '%s\\n' 'insecure'; fi",
-  "  printf '%s\\n' 'write-out = \"\\n" + CURL_STATUS_MARKER + "%{http_code}\"'",
-  "} | curl --silent --show-error --fail-with-body --config -"
+  "  {",
+  "    {",
+  "      printf '%s\\n' 'url = \"'\"$ZABBIX_URL\"'\"'",
+  "      printf '%s\\n' 'request = \"POST\"'",
+  "      printf '%s\\n' 'header = \"Content-Type: application/json\"'",
+  "      if [ \"$ZABBIX_AUTH\" = 1 ]; then printf '%s\\n' 'header = \"Authorization: Bearer '\"$ZABBIX_TOKEN\"'\"'; fi",
+  "      printf '%s\\n' 'data = \"'\"$ZABBIX_BODY\"'\"'",
+  "      printf '%s\\n' 'connect-timeout = \"'\"$ZABBIX_CONNECT_TIMEOUT\"'\"'",
+  "      printf '%s\\n' 'max-time = \"'\"$ZABBIX_TOTAL_TIMEOUT\"'\"'",
+  "      printf '%s\\n' 'max-filesize = \"'\"$ZABBIX_MAX_BODY_BYTES\"'\"'",
+  "      if [ -n \"$ZABBIX_CA_FILE\" ]; then printf '%s\\n' 'cacert = \"'\"$ZABBIX_CA_FILE\"'\"'; fi",
+  "      if [ \"$ZABBIX_INSECURE\" = 1 ]; then printf '%s\\n' 'insecure'; fi",
+  "      printf '%s\\n' 'write-out = \"\\n" + CURL_STATUS_MARKER + "%{http_code}\"'",
+  "    } | curl --silent --show-error --fail-with-body --config -",
+  "  } 2>&1 1>&4 | head -c \"$ZABBIX_MAX_STDERR_BYTES\" >&2",
+  "} 4>&1 | head -c \"$ZABBIX_MAX_BODY_BYTES\""
 ].join("\n")
 
 function curlArgv() {
@@ -735,7 +771,9 @@ function buildCurlEnvironment(endpoint, body, token, options) {
     ZABBIX_CA_FILE: curlConfigEscape(config.caCertificateFile || ""),
     ZABBIX_INSECURE: config.insecureTls === true ? "1" : "0",
     ZABBIX_CONNECT_TIMEOUT: String(connectTimeout),
-    ZABBIX_TOTAL_TIMEOUT: String(totalTimeout)
+    ZABBIX_TOTAL_TIMEOUT: String(totalTimeout),
+    ZABBIX_MAX_BODY_BYTES: String(MAX_RESPONSE_BYTES),
+    ZABBIX_MAX_STDERR_BYTES: String(MAX_STDERR_BYTES)
   }
 }
 
@@ -747,9 +785,11 @@ function buildApiInfoVersionRequest(id) {
   return request(id === undefined ? 1 : id, "apiinfo.version", {})
 }
 
-// Step one of a refresh: every problem matching the server-side filters, with
-// just enough output to rank them. No limit — the whole point is to see the
-// complete set before deciding what is worth fetching in full.
+// Step one of a refresh: the problems matching the server-side filters, with
+// just enough output to rank them. Ranking wants the complete set, but an
+// unbounded one is the server dictating how much memory the bar uses, so the
+// census is capped server-side at MAX_CENSUS_ROWS of the newest problems and
+// ranking happens within that window.
 function buildProblemCensusRequest(options, id) {
   var config = options || {}
   var acknowledgement = parseAcknowledgement(config.acknowledgement)
@@ -760,7 +800,8 @@ function buildProblemCensusRequest(options, id) {
     recent: false,
     severities: parseSeveritySelection(config.severities),
     sortfield: ["eventid"],
-    sortorder: "DESC"
+    sortorder: "DESC",
+    limit: MAX_CENSUS_ROWS
   }
   // Omitting either flag is what returns both kinds; only exclusions are sent.
   if (config.showSuppressed === false) params.suppressed = false
@@ -868,6 +909,9 @@ function classifyCurlResult(exitCode, stdout, stderr, secrets) {
   var code = Number(exitCode)
   var parsed = parseCurlOutput(stdout)
   if (parsed.ok && parsed.status >= 300) return classifyHttpStatus(parsed.status)
+  // 63 is curl refusing a body that declares itself oversized; 23 and 141 are
+  // curl losing the pipe once `head` has taken its cap and walked away.
+  if (code === 63 || code === 23 || code === 141) return errorResult("response-size", "Zabbix response was too large", code)
   if (code === 0 && parsed.ok) return { ok: true, category: "", message: "", code: 0, status: parsed.status, body: parsed.body }
   if (code === 3) return errorResult("endpoint", "Zabbix API endpoint is invalid", code)
   if (code === 5 || code === 6) return errorResult("network", "Cannot resolve the Zabbix server", code)
@@ -940,11 +984,11 @@ function flag(value) {
 
 function normalizeTags(tags) {
   var output = []
-  for (var i = 0; i < (tags instanceof Array ? tags.length : 0); i++) {
+  for (var i = 0; i < (tags instanceof Array ? tags.length : 0) && output.length < MAX_TAGS_PER_PROBLEM; i++) {
     var tag = tags[i]
     if (!tag || typeof tag !== "object") continue
-    var name = trim(tag.tag)
-    var value = trim(tag.value)
+    var name = boundedText(tag.tag)
+    var value = boundedText(tag.value)
     if (name === "" && value === "") continue
     output.push({ tag: name, value: value })
   }
@@ -964,7 +1008,7 @@ function normalizeProblem(raw) {
   return {
     eventId: eventId,
     triggerId: triggerId,
-    name: trim(raw.name) || "Unnamed problem",
+    name: boundedText(raw.name) || "Unnamed problem",
     clock: clock,
     timestampMs: clock * 1000,
     severity: severity,
@@ -992,23 +1036,25 @@ function normalizeProblemResult(rows, problemLimit) {
 
 function normalizeHosts(rows) {
   var map = {}
-  for (var i = 0; i < (rows instanceof Array ? rows.length : 0); i++) {
+  var kept = 0
+  for (var i = 0; i < (rows instanceof Array ? rows.length : 0) && kept < MAX_CENSUS_ROWS; i++) {
     var row = rows[i]
     if (!row || typeof row !== "object") continue
     var triggerId = idString(row.triggerid)
     if (triggerId === "") continue
     var hosts = []
     var seen = {}
-    for (var h = 0; h < (row.hosts instanceof Array ? row.hosts.length : 0); h++) {
+    for (var h = 0; h < (row.hosts instanceof Array ? row.hosts.length : 0) && hosts.length < MAX_HOSTS_PER_TRIGGER; h++) {
       var source = row.hosts[h]
       if (!source || typeof source !== "object") continue
       var hostId = idString(source.hostid)
-      var name = trim(source.name)
+      var name = boundedText(source.name)
       var key = hostId || name
       if (key === "" || seen[key]) continue
       seen[key] = true
       hosts.push({ hostId: hostId, name: name || "Unnamed host" })
     }
+    if (!Object.prototype.hasOwnProperty.call(map, triggerId)) kept += 1
     map[triggerId] = hosts
   }
   return map
@@ -1156,7 +1202,7 @@ function normalizeCensusRow(raw) {
 function normalizeCensus(rows) {
   var source = rows instanceof Array ? rows : []
   var output = []
-  for (var i = 0; i < source.length; i++) {
+  for (var i = 0; i < source.length && output.length < MAX_CENSUS_ROWS; i++) {
     var row = normalizeCensusRow(source[i])
     if (row) output.push(row)
   }
@@ -1270,6 +1316,13 @@ if (typeof module !== "undefined") {
     MAX_BACKOFF_MS: MAX_BACKOFF_MS,
     CLAIM_TIMEOUT_MS: CLAIM_TIMEOUT_MS,
     CURL_STATUS_MARKER: CURL_STATUS_MARKER,
+    MAX_RESPONSE_BYTES: MAX_RESPONSE_BYTES,
+    MAX_STDERR_BYTES: MAX_STDERR_BYTES,
+    MAX_SERVERS: MAX_SERVERS,
+    MAX_CENSUS_ROWS: MAX_CENSUS_ROWS,
+    MAX_HOSTS_PER_TRIGGER: MAX_HOSTS_PER_TRIGGER,
+    MAX_TAGS_PER_PROBLEM: MAX_TAGS_PER_PROBLEM,
+    MAX_TEXT_LENGTH: MAX_TEXT_LENGTH,
     FETCH_SCRIPT: FETCH_SCRIPT,
     PROBLEM_OUTPUT: PROBLEM_OUTPUT,
     CENSUS_OUTPUT: CENSUS_OUTPUT,
@@ -1277,6 +1330,7 @@ if (typeof module !== "undefined") {
     ACKNOWLEDGEMENTS: ACKNOWLEDGEMENTS,
     ACK_ACTION_ACKNOWLEDGE: ACK_ACTION_ACKNOWLEDGE,
     trim: trim,
+    boundedText: boundedText,
     clampInteger: clampInteger,
     expandHome: expandHome,
     firstNonEmptyLine: firstNonEmptyLine,

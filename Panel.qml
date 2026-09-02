@@ -66,6 +66,7 @@ Panel {
     readonly property int serverEditorCursorBase: 0
     readonly property int insecureTlsCursorIndex: editingServerIndex >= 0 ? serverEditorCursorBase + editingServerIndex + 1 : -1
     readonly property int removeServerCursorIndex: editingServerIndex >= 0 ? insecureTlsCursorIndex + 1 : -1
+    readonly property bool atServerCap: servers.length >= Model.MAX_SERVERS
     readonly property int addServerCursorIndex: serverEditorCursorBase + servers.length + (editingServerIndex >= 0 ? 2 : 0)
     readonly property int serverFilterCursorBase: addServerCursorIndex + 1
     readonly property int severityCursorBase: serverFilterCursorBase + (multiServer ? servers.length : 0)
@@ -218,6 +219,10 @@ Panel {
 
     function addServer() {
         var list = serverEntries();
+        // normalizeServers drops anything past the cap, so a row added beyond
+        // it would silently never poll.
+        if (list.length >= Model.MAX_SERVERS)
+            return;
         var id = Model.newServerId(list);
         list.push({
             id: id,
@@ -459,6 +464,7 @@ Panel {
             "token-file": "API token file error",
             permission: "API permission denied",
             http: "Zabbix HTTP error",
+            "response-size": "Zabbix response too large",
             transport: "Request transport failed",
             "json-rpc": "Zabbix API error",
             version: "Unsupported Zabbix version",
@@ -509,6 +515,7 @@ Panel {
             "token-file": "token-file",
             permission: "permission",
             http: "HTTP",
+            "response-size": "response-size",
             transport: "transport",
             "json-rpc": "API",
             version: "version",
@@ -1035,9 +1042,11 @@ Panel {
                         Button {
                             id: addServerButton
                             x: serversContent.indent
-                            text: "Add server"
+                            text: root.atServerCap ? "Server limit reached" : "Add server"
                             iconText: "󰐕"
                             bordered: true
+                            enabled: !root.atServerCap
+                            opacity: enabled ? 1 : 0.5
                             hasCursor: root.cursorActive && root.cursorIndex === root.addServerCursorIndex
                             tooltipText: "Add another Zabbix server to poll"
                             foreground: root.foreground

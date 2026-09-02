@@ -187,7 +187,7 @@ equivalent array. Non-secret settings are persisted in the widget entry in
 
 | Key | Default | Allowed values and behavior |
 |---|---|---|
-| `servers` | `[]` | Array of `{id, name, url, tokenFile, caCertificateFile, insecureTls}`. Edited in the panel's `SERVERS` section; see above. |
+| `servers` | `[]` | Array of `{id, name, url, tokenFile, caCertificateFile, insecureTls}`. Edited in the panel's `SERVERS` section; see above. At most 16 are read; entries past that are ignored. |
 | `selectedServers` | `[]` | Ids the server filter includes. Empty means every server. Unknown ids are dropped, and the last selected server cannot be deselected. |
 | `refreshIntervalSec` | `60` | Integer from `15` to `3600`; settings UI step `15`. |
 | `problemLimit` | `100` | Integer from `1` to `1000`; settings UI step `25`. |
@@ -368,8 +368,9 @@ server's poll is shared across every monitor showing the widget.
 ## Limits And Refresh Behavior
 
 - A refresh ranks before it fetches, in three requests. A **census**
-  `problem.get` returns every problem matching the server-side filters with
-  only `eventid`, `objectid`, `severity`, and `clock`. A **`trigger.get`** with
+  `problem.get` returns the problems matching the server-side filters — up to
+  the census cap below — with only `eventid`, `objectid`, `severity`, and
+  `clock`. A **`trigger.get`** with
   `monitored` resolves host names and, more importantly, reveals which of those
   triggers Zabbix still considers live. A **detail** `problem.get`, addressed
   by `eventids`, then pulls names, tags, and acknowledgement state for the
@@ -380,9 +381,15 @@ server's poll is shared across every monitor showing the widget.
   `problemLimit`: `problem.get` cannot sort by severity, and a newest-N window
   hides older high-severity problems once a server has more matching problems
   than the limit.
-- Truncation is decided by the ranking, over the whole live set, so the warning
-  means "more live problems exist than the limit" rather than "the fetch window
-  filled up".
+- The census itself is bounded: it asks Zabbix for at most **5000** matching
+  problems, newest first. Ranking is therefore over the newest 5000 rather
+  than over an unbounded set. Beyond that the ranking cannot see, and a server
+  is not allowed to decide how much memory the bar holds. With `problemLimit`
+  capped at 1000, the window is at least five times the largest result the
+  panel can show.
+- Truncation is decided by the ranking, over the live set inside that window,
+  so the warning means "more live problems exist than the limit" rather than
+  "the fetch window filled up".
 - The severity, acknowledgement, suppressed, and symptom filters are applied by
   Zabbix; the monitored filter is applied when joining the census to
   `trigger.get`, because `problem.get` offers no equivalent.
@@ -437,6 +444,14 @@ server's poll is shared across every monitor showing the widget.
   in the child process environment while a request runs, and briefly in Bash
   and curl memory. Environment variables are not a secret from root or from
   processes allowed to inspect this user's `/proc/<pid>/environ`.
+- Every API response is treated as untrusted in size as well as content. curl
+  is given a `max-filesize`, and its output is read through a hard **8 MiB**
+  cap and its diagnostics through a **4 KiB** cap, both enforced while the
+  response is still arriving rather than after it has been collected. Passing
+  either cap ends the request as a `Zabbix response too large` error; nothing
+  is parsed. Past that, the parsed model is bounded too: at most 5000 census
+  rows, 20 tags per problem, 20 hosts per trigger, 512 characters per
+  API-controlled string, and 16 configured servers.
 - Omarchy plugins are unsandboxed code in the same long-lived shell process.
   The trust boundary includes your user account, root, `omarchy-shell`, every
   enabled shell plugin, and programs with same-user process-inspection access.

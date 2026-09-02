@@ -338,9 +338,9 @@ Item {
         startRequest("identity", identityRequest, false);
     }
 
-    // A refresh ranks before it fetches: census every matching problem cheaply,
-    // ask trigger.get which of them are still live, then pull full detail for
-    // the survivors that fit the limit.
+    // A refresh ranks before it fetches: census the matching problems cheaply,
+    // up to the census cap, ask trigger.get which of them are still live, then
+    // pull full detail for the survivors that fit the limit.
     function startCensusRequest() {
         connectionState = "fetch_problems";
         startRequest("census", Model.buildProblemCensusRequest({
